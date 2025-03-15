@@ -38,108 +38,71 @@ app.use((req, res, next) => {
 app.use(cors());
 app.use(express.json());
 
+// Rota padrão para a raiz
+app.get('/', (req, res) => {
+  res.send('Backend do Controle de Produção está ativo! Acesse a API em /pedidos ou o frontend em /dashboard.');
+});
+
 // Middleware para log de requisições
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Body:`, req.body);
   next();
 });
 
-// Conectar ao banco SQLite e inicializar tabelas
+// Conectar ao banco SQLite
 const db = new sqlite3.Database('pedidos.db', (err) => {
   if (err) {
     console.error('Erro ao conectar ao banco:', err.message);
-    process.exit(1); // Encerra o servidor se a conexão falhar
+    process.exit(1);
   } else {
     console.log('Conectado ao banco SQLite');
-    initializeDatabase().then(() => startServer()).catch(err => {
-      console.error('Erro ao inicializar o banco:', err.message);
-      process.exit(1);
-    });
+    initializeDatabase();
   }
 });
 
 // Função para inicializar o banco de dados
 const initializeDatabase = () => {
-  return new Promise((resolve, reject) => {
-    // Criar ou verificar a tabela pedidos com dataInicioPausa
-    db.run(`
-      CREATE TABLE IF NOT EXISTS pedidos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        empresa TEXT NOT NULL,
-        numeroOS TEXT NOT NULL,
-        dataEntrada TEXT NOT NULL,
-        previsaoEntrega TEXT NOT NULL,
-        responsavel TEXT,
-        status TEXT NOT NULL,
-        inicio TEXT NOT NULL,
-        tempo REAL DEFAULT 0,
-        peso REAL,
-        volume REAL,
-        dataConclusao TEXT,
-        pausado INTEGER DEFAULT 0,
-        tempoPausado REAL DEFAULT 0,
-        dataPausada TEXT,
-        dataInicioPausa TEXT
-      )
-    `, (err) => {
-      if (err) {
-        console.error('Erro ao criar/verificar tabela pedidos:', err.message);
-        reject(err);
-      } else {
-        console.log('Tabela pedidos verificada/criada');
-
-        // Criar ou verificar a tabela itens_pedidos
-        db.run(`
-          CREATE TABLE IF NOT EXISTS itens_pedidos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pedido_id INTEGER,
-            codigoDesenho TEXT NOT NULL,
-            quantidadePedido INTEGER NOT NULL,
-            quantidadeEntregue INTEGER DEFAULT 0,
-            FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
-          )
-        `, (err) => {
-          if (err) {
-            console.error('Erro ao criar/verificar tabela itens_pedidos:', err.message);
-            reject(err);
-          } else {
-            console.log('Tabela itens_pedidos verificada/criada');
-            resolve();
-          }
-        });
-      }
-    });
-  });
-};
-
-// Função para iniciar o servidor
-const startServer = () => {
-  app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
-  }).on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`Porta ${PORT} já está em uso. Tentando liberar...`);
-      require('child_process').exec(`netstat -aon | findstr :${PORT} | findstr LISTENING`, (error, stdout) => {
-        if (stdout) {
-          const pid = stdout.match(/\d+$/)[0];
-          console.log(`Encerrando processo ${pid} na porta ${PORT}`);
-          require('child_process').exec(`taskkill /PID ${pid} /F`, (err) => {
-            if (err) {
-              console.error('Falha ao encerrar processo:', err.message);
-              process.exit(1);
-            } else {
-              console.log('Porta liberada, reiniciando servidor...');
-              startServer(); // Tenta reiniciar o servidor
-            }
-          });
-        } else {
-          console.error('Nenhum processo encontrado na porta', PORT);
-          process.exit(1);
-        }
-      });
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pedidos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      empresa TEXT NOT NULL,
+      numeroOS TEXT NOT NULL,
+      dataEntrada TEXT NOT NULL,
+      previsaoEntrega TEXT NOT NULL,
+      responsavel TEXT,
+      status TEXT NOT NULL,
+      inicio TEXT NOT NULL,
+      tempo REAL DEFAULT 0,
+      peso REAL,
+      volume REAL,
+      dataConclusao TEXT,
+      pausado INTEGER DEFAULT 0,
+      tempoPausado REAL DEFAULT 0,
+      dataPausada TEXT,
+      dataInicioPausa TEXT
+    )
+  `, (err) => {
+    if (err) {
+      console.error('Erro ao criar/verificar tabela pedidos:', err.message);
     } else {
-      console.error('Erro ao iniciar o servidor:', err.message);
-      process.exit(1);
+      console.log('Tabela pedidos verificada/criada');
+    }
+  });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS itens_pedidos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pedido_id INTEGER,
+      codigoDesenho TEXT NOT NULL,
+      quantidadePedido INTEGER NOT NULL,
+      quantidadeEntregue INTEGER DEFAULT 0,
+      FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
+    )
+  `, (err) => {
+    if (err) {
+      console.error('Erro ao criar/verificar tabela itens_pedidos:', err.message);
+    } else {
+      console.log('Tabela itens_pedidos verificada/criada');
     }
   });
 };
@@ -225,19 +188,17 @@ app.get('/pedidos', (req, res) => {
         return res.status(500).json({ message: 'Erro ao listar itens', error: err.message });
       }
       const pedidosComItens = pedidos.map(pedido => {
-        let tempoFinal = pedido.tempoPausado || 0; // Inicializa com tempoPausado
+        let tempoFinal = pedido.tempoPausado || 0;
         if (pedido.status === 'concluido') {
-          tempoFinal = pedido.tempo; // Usa o tempo armazenado para pedidos concluídos
+          tempoFinal = pedido.tempo;
         } else if (pedido.status === 'andamento') {
           if (pedido.pausado) {
-            tempoFinal = pedido.tempoPausado || 0; // Mantém o tempoPausado ao pausar
+            tempoFinal = pedido.tempoPausado || 0;
           } else if (pedido.dataPausada && !pedido.pausado) {
-            // Após retomada, usa tempoPausado e calcula apenas o tempo desde dataPausada
             const tempoAcumulado = pedido.tempoPausado || 0;
             const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
             tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
           } else {
-            // Sem pausa, calcula desde o início
             tempoFinal = Math.round((pedido.tempoPausado || 0) + calcularTempo(pedido.inicio));
           }
         }
@@ -262,13 +223,11 @@ app.post('/pedidos', async (req, res) => {
 
   console.log('Dados recebidos no POST /pedidos:', req.body);
 
-  // Validação dos campos obrigatórios
   if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
     console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
     return res.status(400).json({ message: 'Campos obrigatórios ausentes ou itens inválidos' });
   }
 
-  // Validação dos itens
   for (const item of itens) {
     if (!item.codigoDesenho || item.codigoDesenho.trim() === '' || item.quantidadePedido === undefined || item.quantidadePedido === null || item.quantidadePedido === '') {
       console.error('Item inválido:', item);
@@ -282,7 +241,6 @@ app.post('/pedidos', async (req, res) => {
     }
   }
 
-  // Converter o formato da data inicio para YYYY-MM-DD HH:MM:SS
   const inicioFormatado = converterFormatoData(inicio);
 
   const pedidoSql = `
@@ -332,7 +290,6 @@ app.put('/pedidos/:id', async (req, res) => {
 
   console.log('Dados recebidos no PUT /pedidos:', req.body);
 
-  // Converter o formato da data inicio, dataConclusao, dataPausada e dataInicioPausa
   const inicioFormatado = converterFormatoData(inicio);
   const dataConclusaoFormatada = status === 'concluido' && !dataConclusao
     ? new Date().toISOString().slice(0, 19).replace('T', ' ')
@@ -340,13 +297,10 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataPausadaFormatada = dataPausada ? converterFormatoData(dataPausada) : null;
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
-  // Ajustar o tempo com base no estado pausado
   let tempoFinal = tempo || 0;
   if (pausado === 1) {
-    // Ao pausar, o tempo deve ser igual a tempoPausado
     tempoFinal = tempoPausado || tempo || 0;
   } else if (dataPausada && pausado === 0) {
-    // Ao retomar, o tempo deve ser tempoPausado mais o tempo decorrido desde dataPausada
     const tempoAcumulado = tempoPausado || 0;
     const tempoDesdeRetomada = calcularTempo(dataPausada, formatDateToLocalISO(new Date(), `retomarPedido - pedido ${id}`));
     tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
@@ -473,4 +427,9 @@ app.post('/enviar-email', async (req, res) => {
     console.error('Erro ao enviar e-mail:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao enviar e-mail', error: error.message, stack: error.stack });
   }
+});
+
+// Iniciar o servidor
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
