@@ -32,10 +32,19 @@ const calcularTempo = (inicio, fim) => {
 
 // Middleware para Content-Security-Policy
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:5000 ws://localhost:3000");
+  // Ajustado para permitir conexões ao backend no Render
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://producao-dashboard-backend.onrender.com ws://producao-dashboard-frontend.onrender.com"
+  );
   next();
 });
-app.use(cors());
+
+app.use(cors({
+  origin: 'https://producao-dashboard-frontend.onrender.com',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Rota padrão para a raiz
