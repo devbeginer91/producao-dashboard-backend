@@ -396,7 +396,7 @@ app.post('/pedidos', async (req, res) => {
     RETURNING id
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
-
+  console.log('Recebendo POST /pedidos');
   try {
     console.log('Inserindo pedido principal com valores:', pedidoValues);
     const result = await pool.query(pedidoSql, pedidoValues);
