@@ -143,7 +143,6 @@ const initializeDatabase = async () => {
     console.error('Erro ao inicializar o banco:', err.message);
   }
 };
-
 // Função para executar uma query SQLite como Promise
 function runQuery(sql, params) {
   return new Promise((resolve, reject) => {
@@ -246,71 +245,6 @@ app.get('/pedidos', async (req, res) => {
   } catch (error) {
     console.error('Erro ao listar pedidos:', error.message);
     res.status(500).json({ message: 'Erro ao listar pedidos', error: error.message });
-  }
-});
-// Criar um novo pedido com itens
-app.post('/pedidos', async (req, res) => {
-  const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
-
-  console.log('Dados recebidos no POST /pedidos:', req.body);
-
-  if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
-    console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
-    return res.status(400).json({ message: 'Campos obrigatórios ausentes ou itens inválidos' });
-  }
-
-  for (const item of itens) {
-    if (!item.codigoDesenho || item.codigoDesenho.trim() === '' || item.quantidadePedido === undefined || item.quantidadePedido === null || item.quantidadePedido === '') {
-      console.error('Item inválido:', item);
-      return res.status(400).json({ message: 'Todos os itens devem ter código e quantidade de pedido válidos' });
-    }
-    item.quantidadePedido = parseInt(item.quantidadePedido, 10);
-    item.quantidadeEntregue = parseInt(item.quantidadeEntregue || 0, 10);
-    if (isNaN(item.quantidadePedido) || item.quantidadePedido < 0) {
-      console.error('Quantidade de pedido inválida:', item);
-      return res.status(400).json({ message: 'Quantidade de pedido deve ser um número positivo' });
-    }
-  }
-
-  const inicioFormatado = converterFormatoData(inicio);
-
-  const pedidoSql = `
-    INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio)
-    VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-  `;
-  const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
-
-  try {
-    console.log('Inserindo pedido principal com valores:', pedidoValues);
-    const result = await pool.query(pedidoSql, pedidoValues);
-    const pedidoId = result.rows[0].id;
-    console.log('Pedido inserido com ID:', pedidoId)
-
-    const itemSql = `
-      INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-      VALUES ($1, $2, $3, $4)
-    `;
-    const totalItens = itens.length;
-
-    if (totalItens === 0) {
-      const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens: [] };
-      return res.status(201).json(novoPedido);
-    }
-
-    const itemPromises = itens.map(item => {
-      const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-      console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
-      return runQuery(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
-    });
-
-    await Promise.all(itemPromises);
-    console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
-
-    const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens };
-    res.status(201).json(novoPedido);
-  } catch (err) {
-    console.error('Erro ao processar pedido:', err.message, 'Stack:', err.stack);
-    res.status(500).json({ message: 'Erro ao processar pedido', error: err.message, stack: err.stack });
   }
 });
 
@@ -428,6 +362,70 @@ app.delete('/pedidos/:id', async (req, res) => {
   } catch (error) {
     console.error('Erro ao excluir pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao excluir pedido', error: error.message, stack: error.stack });
+  }
+});
+///POST /PEDIDOS
+app.post('/pedidos', async (req, res) => {
+  const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
+
+  console.log('Dados recebidos no POST /pedidos:', req.body);
+
+  if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
+    console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
+    return res.status(400).json({ message: 'Campos obrigatórios ausentes ou itens inválidos' });
+  }
+
+  for (const item of itens) {
+    if (!item.codigoDesenho || item.codigoDesenho.trim() === '' || item.quantidadePedido === undefined || item.quantidadePedido === null || item.quantidadePedido === '') {
+      console.error('Item inválido:', item);
+      return res.status(400).json({ message: 'Todos os itens devem ter código e quantidade pedida válidos' });
+    }
+    item.quantidadePedido = parseInt(item.quantidadePedido, 10);
+    item.quantidadeEntregue = parseInt(item.quantidadeEntregue || 0, 10);
+    if (isNaN(item.quantidadePedido) || item.quantidadePedido < 0) {
+      console.error('Quantidade pedida inválida:', item);
+      return res.status(400).json({ message: 'Quantidade pedida deve ser um número positivo' });
+    }
+  }
+
+  const inicioFormatado = converterFormatoData(inicio);
+
+  const pedidoSql = `
+    INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING id
+  `;
+  const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
+
+  try {
+    console.log('Inserindo pedido principal com valores:', pedidoValues);
+    const result = await pool.query(pedidoSql, pedidoValues);
+    const pedidoId = result.rows[0].id;
+    console.log('Pedido inserido com ID:', pedidoId);
+
+    const itemSql = `
+      INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
+      VALUES ($1, $2, $3, $4)
+    `;
+    const totalItens = itens.length;
+
+    if (totalItens === 0) {
+      const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens: [] };
+      return res.status(201).json(novoPedido);
+    }
+
+    for (const item of itens) {
+      const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+      console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
+      await pool.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+    }
+    console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
+
+    const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens };
+    res.status(201).json(novoPedido);
+  } catch (error) {
+    console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
+    res.status(500).json({ message: 'Erro ao processar pedido', error: error.message, stack: error.stack });
   }
 });
 
