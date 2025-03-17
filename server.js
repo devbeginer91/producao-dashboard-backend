@@ -238,16 +238,21 @@ app.get('/pedidos', async (req, res) => {
         dataPausada: pedido.dataPausada ? converterFormatoData(pedido.dataPausada) : null,
         dataInicioPausa: pedido.dataInicioPausa ? converterFormatoData(pedido.dataInicioPausa) : null,
         tempo: tempoFinal,
-        itens: itens.filter(item => item.pedido_id === pedido.id)
+        tempoPausado: pedido.tempoPausado ? pedido.tempoPausado.toString() : '0', // Converte para string
+        pausado: pedido.pausado ? pedido.pausado.toString() : '0', // Converte para string
+        itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
+          ...item,
+          quantidadePedido: item.quantidadePedido ? item.quantidadePedido.toString() : '0', // Converte para string
+          quantidadeEntregue: item.quantidadeEntregue ? item.quantidadeEntregue.toString() : '0' // Converte para string
+        }))
       };
     });
     res.json(pedidosComItens);
-  } catch (error) {
-    console.error('Erro ao listar pedidos:', error.message);
-    res.status(500).json({ message: 'Erro ao listar pedidos', error: error.message });
+  } catch (err) {
+    console.error('Erro ao listar pedidos:', err.message);
+    res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
   }
 });
-
 // Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
@@ -326,11 +331,7 @@ app.put('/pedidos/:id', async (req, res) => {
     `;
     const totalItens = itens.length;
 
-    if (totalItens === 0) {
-      const pedidoAtualizado = { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, tempo: tempoFinal, peso, volume, dataConclusao: dataConclusaoFormatada, pausado, itens: [] };
-      return res.json(pedidoAtualizado);
-    }
-
+    // Inserir os novos itens
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
@@ -338,7 +339,26 @@ app.put('/pedidos/:id', async (req, res) => {
     }
     console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
 
-    const pedidoAtualizado = { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, tempo: tempoFinal, peso, volume, dataConclusao: dataConclusaoFormatada, pausado, itens };
+    // Retornar o objeto completo com todos os campos
+    const pedidoAtualizado = { 
+      id, 
+      empresa, 
+      numeroOS, 
+      dataEntrada, 
+      previsaoEntrega, 
+      responsavel, 
+      status, 
+      inicio: inicioFormatado, 
+      tempo: tempoFinal, 
+      peso, 
+      volume, 
+      dataConclusao: dataConclusaoFormatada, 
+      pausado: pausado || 0, 
+      tempoPausado: tempoPausado || 0, 
+      dataPausada: dataPausadaFormatada, 
+      dataInicioPausa: dataInicioPausaFormatada, 
+      itens 
+    };
     res.json(pedidoAtualizado);
   } catch (error) {
     console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
