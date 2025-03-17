@@ -60,7 +60,7 @@ app.use((req, res, next) => {
 
 // Conectar ao banco SQLite
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgres://producao_user:abc123@pg-host.render.com/producao_dashboard_db',
+  connectionString: process.env.DATABASE_URL || 'postgresql://producao_dashboard_db_user:CiMFfDpnp8etmNOPpgVVELSwzTtHeJ12@dpg-cvc5vl3tq21c73dlt630-a.oregon-postgres.render.com/producao_dashboard_db',
   ssl: {
     rejectUnauthorized: false
   }
