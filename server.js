@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -59,65 +59,93 @@ app.use((req, res, next) => {
 });
 
 // Conectar ao banco SQLite
-const db = new sqlite3.Database('pedidos.db', (err) => {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgres://producao_user:abc123@pg-host.render.com/producao_dashboard_db',
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+pool.connect((err) => {
   if (err) {
-    console.error('Erro ao conectar ao banco:', err.message);
+    console.error('Erro ao conectar ao PostgreSQL:', err.message);
     process.exit(1);
   } else {
-    console.log('Conectado ao banco SQLite');
+    console.log('Conectado ao banco PostgreSQL');
     initializeDatabase();
   }
 });
 
-// Função para inicializar o banco de dados
-const initializeDatabase = () => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS pedidos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      empresa TEXT NOT NULL,
-      numeroOS TEXT NOT NULL,
-      dataEntrada TEXT NOT NULL,
-      previsaoEntrega TEXT NOT NULL,
-      responsavel TEXT,
-      status TEXT NOT NULL,
-      inicio TEXT NOT NULL,
-      tempo REAL DEFAULT 0,
-      peso REAL,
-      volume REAL,
-      dataConclusao TEXT,
-      pausado INTEGER DEFAULT 0,
-      tempoPausado REAL DEFAULT 0,
-      dataPausada TEXT,
-      dataInicioPausa TEXT
-    )
-  `, (err) => {
-    if (err) {
-      console.error('Erro ao criar/verificar tabela pedidos:', err.message);
-    } else {
-      console.log('Tabela pedidos verificada/criada');
-    }
-  });
+const db = {
+  run: (sql, params = []) => {
+    return new Promise((resolve, reject) => {
+      pool.query(sql, params, (err, result) => {
+        if (err) reject(err);
+        else resolve({ lastID: result.rows[0]?.id, changes: result.rowCount });
+      });
+    });
+  },
+  get: (sql, params = []) => {
+    return new Promise((resolve, reject) => {
+      pool.query(sql, params, (err, result) => {
+        if (err) reject(err);
+        else resolve(result.rows[0]);
+      });
+    });
+  },
+  all: (sql, params = []) => {
+    return new Promise((resolve, reject) => {
+      pool.query(sql, params, (err, result) => {
+        if (err) reject(err);
+        else resolve(result.rows);
+      });
+    });
+  }
+};
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS itens_pedidos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pedido_id INTEGER,
-      codigoDesenho TEXT NOT NULL,
-      quantidadePedido INTEGER NOT NULL,
-      quantidadeEntregue INTEGER DEFAULT 0,
-      FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
-    )
-  `, (err) => {
-    if (err) {
-      console.error('Erro ao criar/verificar tabela itens_pedidos:', err.message);
-    } else {
-      console.log('Tabela itens_pedidos verificada/criada');
-    }
-  });
+// Função para inicializar o banco de dados
+const initializeDatabase = async () => {
+  try {
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS pedidos (
+        id SERIAL PRIMARY KEY,
+        empresa TEXT NOT NULL,
+        numeroOS TEXT NOT NULL,
+        dataEntrada TEXT NOT NULL,
+        previsaoEntrega TEXT NOT NULL,
+        responsavel TEXT,
+        status TEXT NOT NULL,
+        inicio TEXT NOT NULL,
+        tempo FLOAT DEFAULT 0,
+        peso FLOAT,
+        volume FLOAT,
+        dataConclusao TEXT,
+        pausado INTEGER DEFAULT 0,
+        tempoPausado FLOAT DEFAULT 0,
+        dataPausada TEXT,
+        dataInicioPausa TEXT
+      )
+    `);
+    console.log('Tabela pedidos verificada/criada');
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS itens_pedidos (
+        id SERIAL PRIMARY KEY,
+        pedido_id INTEGER,
+        codigoDesenho TEXT NOT NULL,
+        quantidadePedido INTEGER NOT NULL,
+        quantidadeEntregue INTEGER DEFAULT 0,
+        FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('Tabela itens_pedidos verificada/criada');
+  } catch (err) {
+    console.error('Erro ao inicializar o banco:', err.message);
+  }
 };
 
 // Função para executar uma query SQLite como Promise
-const runQuery = (sql, params) => {
+function runQuery(sql, params) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
       if (err) {
@@ -127,7 +155,7 @@ const runQuery = (sql, params) => {
       }
     });
   });
-};
+}
 
 // Função para converter e validar formato de data para YYYY-MM-DD HH:MM:SS
 const converterFormatoData = (dataInput) => {
@@ -185,47 +213,41 @@ const transporter = nodemailer.createTransport({
 });
 
 // Listar todos os pedidos com itens
-app.get('/pedidos', (req, res) => {
-  db.all('SELECT * FROM pedidos', (err, pedidos) => {
-    if (err) {
-      console.error('Erro ao listar pedidos:', err.message);
-      return res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
-    }
-    db.all('SELECT * FROM itens_pedidos', (err, itens) => {
-      if (err) {
-        console.error('Erro ao listar itens:', err.message);
-        return res.status(500).json({ message: 'Erro ao listar itens', error: err.message });
-      }
-      const pedidosComItens = pedidos.map(pedido => {
-        let tempoFinal = pedido.tempoPausado || 0;
-        if (pedido.status === 'concluido') {
-          tempoFinal = pedido.tempo;
-        } else if (pedido.status === 'andamento') {
-          if (pedido.pausado) {
-            tempoFinal = pedido.tempoPausado || 0;
-          } else if (pedido.dataPausada && !pedido.pausado) {
-            const tempoAcumulado = pedido.tempoPausado || 0;
-            const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
-            tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
-          } else {
-            tempoFinal = Math.round((pedido.tempoPausado || 0) + calcularTempo(pedido.inicio));
-          }
+app.get('/pedidos', async (req, res) => {
+  try {
+    const pedidos = await db.all('SELECT * FROM pedidos');
+    const itens = await db.all('SELECT * FROM itens_pedidos');
+    const pedidosComItens = pedidos.map(pedido => {
+      let tempoFinal = pedido.tempoPausado || 0;
+      if (pedido.status === 'concluido') {
+        tempoFinal = pedido.tempo;
+      } else if (pedido.status === 'andamento') {
+        if (pedido.pausado) {
+          tempoFinal = pedido.tempoPausado || 0;
+        } else if (pedido.dataPausada && !pedido.pausado) {
+          const tempoAcumulado = pedido.tempoPausado || 0;
+          const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
+          tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
+        } else {
+          tempoFinal = Math.round((pedido.tempoPausado || 0) + calcularTempo(pedido.inicio));
         }
-        return {
-          ...pedido,
-          inicio: converterFormatoData(pedido.inicio),
-          dataConclusao: pedido.dataConclusao ? converterFormatoData(pedido.dataConclusao) : null,
-          dataPausada: pedido.dataPausada ? converterFormatoData(pedido.dataPausada) : null,
-          dataInicioPausa: pedido.dataInicioPausa ? converterFormatoData(pedido.dataInicioPausa) : null,
-          tempo: tempoFinal,
-          itens: itens.filter(item => item.pedido_id === pedido.id)
-        };
-      });
-      res.json(pedidosComItens);
+      }
+      return {
+        ...pedido,
+        inicio: converterFormatoData(pedido.inicio),
+        dataConclusao: pedido.dataConclusao ? converterFormatoData(pedido.dataConclusao) : null,
+        dataPausada: pedido.dataPausada ? converterFormatoData(pedido.dataPausada) : null,
+        dataInicioPausa: pedido.dataInicioPausa ? converterFormatoData(pedido.dataInicioPausa) : null,
+        tempo: tempoFinal,
+        itens: itens.filter(item => item.pedido_id === pedido.id)
+      };
     });
-  });
+    res.json(pedidosComItens);
+  } catch (error) {
+    console.error('Erro ao listar pedidos:', error.message);
+    res.status(500).json({ message: 'Erro ao listar pedidos', error: error.message });
+  }
 });
-
 // Criar um novo pedido com itens
 app.post('/pedidos', async (req, res) => {
   const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
@@ -240,13 +262,13 @@ app.post('/pedidos', async (req, res) => {
   for (const item of itens) {
     if (!item.codigoDesenho || item.codigoDesenho.trim() === '' || item.quantidadePedido === undefined || item.quantidadePedido === null || item.quantidadePedido === '') {
       console.error('Item inválido:', item);
-      return res.status(400).json({ message: 'Todos os itens devem ter código e quantidade pedida válidos' });
+      return res.status(400).json({ message: 'Todos os itens devem ter código e quantidade de pedido válidos' });
     }
     item.quantidadePedido = parseInt(item.quantidadePedido, 10);
     item.quantidadeEntregue = parseInt(item.quantidadeEntregue || 0, 10);
     if (isNaN(item.quantidadePedido) || item.quantidadePedido < 0) {
-      console.error('Quantidade pedida inválida:', item);
-      return res.status(400).json({ message: 'Quantidade pedida deve ser um número positivo' });
+      console.error('Quantidade de pedido inválida:', item);
+      return res.status(400).json({ message: 'Quantidade de pedido deve ser um número positivo' });
     }
   }
 
@@ -254,19 +276,19 @@ app.post('/pedidos', async (req, res) => {
 
   const pedidoSql = `
     INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
 
   try {
     console.log('Inserindo pedido principal com valores:', pedidoValues);
-    const result = await runQuery(pedidoSql, pedidoValues);
-    const pedidoId = result.lastID;
-    console.log('Pedido inserido com ID:', pedidoId);
+    const result = await pool.query(pedidoSql, pedidoValues);
+    const pedidoId = result.rows[0].id;
+    console.log('Pedido inserido com ID:', pedidoId)
 
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-      VALUES (?, ?, ?, ?)
+      VALUES ($1, $2, $3, $4)
     `;
     const totalItens = itens.length;
 
@@ -317,10 +339,22 @@ app.put('/pedidos/:id', async (req, res) => {
 
   const pedidoSql = `
     UPDATE pedidos SET
-      empresa = ?, numeroOS = ?, dataEntrada = ?, previsaoEntrega = ?, responsavel = ?,
-      status = ?, inicio = ?, tempo = ?, peso = ?, volume = ?, dataConclusao = ?, pausado = ?,
-      tempoPausado = ?, dataPausada = ?, dataInicioPausa = ?
-    WHERE id = ?
+      empresa = $1,
+      numeroOS = $2,
+      dataEntrada = $3,
+      previsaoEntrega = $4,
+      responsavel = $5,
+      status = $6,
+      inicio = $7,
+      tempo = $8,
+      peso = $9,
+      volume = $10,
+      dataConclusao = $11,
+      pausado = $12,
+      tempoPausado = $13,
+      dataPausada = $14,
+      dataInicioPausa = $15
+    WHERE id = $16
   `;
   const pedidoValues = [
     empresa,
@@ -343,18 +377,18 @@ app.put('/pedidos/:id', async (req, res) => {
 
   try {
     console.log('Atualizando pedido com valores:', pedidoValues);
-    const result = await runQuery(pedidoSql, pedidoValues);
-    if (result.changes === 0) {
+    const result = await pool.query(pedidoSql, pedidoValues);
+    if (result.rowCount === 0) {
       console.error('Pedido não encontrado:', id);
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
 
     console.log('Deletando itens antigos para pedido_id:', id);
-    await runQuery('DELETE FROM itens_pedidos WHERE pedido_id = ?', [id]);
+    await pool.query('DELETE FROM itens_pedidos WHERE pedido_id = $1', [id]);
 
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-      VALUES (?, ?, ?, ?)
+      VALUES ($1, $2, $3, $4)
     `;
     const totalItens = itens.length;
 
@@ -363,20 +397,18 @@ app.put('/pedidos/:id', async (req, res) => {
       return res.json(pedidoAtualizado);
     }
 
-    const itemPromises = itens.map(item => {
+    for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
-      return runQuery(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
-    });
-
-    await Promise.all(itemPromises);
+      await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+    }
     console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
 
     const pedidoAtualizado = { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, tempo: tempoFinal, peso, volume, dataConclusao: dataConclusaoFormatada, pausado, itens };
     res.json(pedidoAtualizado);
-  } catch (err) {
-    console.error('Erro ao atualizar pedido:', err.message, 'Stack:', err.stack);
-    res.status(500).json({ message: 'Erro ao atualizar pedido', error: err.message, stack: err.stack });
+  } catch (error) {
+    console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
+    res.status(500).json({ message: 'Erro ao atualizar pedido', error: error.message, stack: error.stack });
   }
 });
 
@@ -386,16 +418,16 @@ app.delete('/pedidos/:id', async (req, res) => {
 
   try {
     console.log('Deletando pedido com id:', id);
-    const result = await runQuery('DELETE FROM pedidos WHERE id = ?', [id]);
-    if (result.changes === 0) {
+    const result = await pool.query('DELETE FROM pedidos WHERE id = $1', [id]);
+    if (result.rowCount === 0) {
       console.error('Pedido não encontrado para exclusão:', id);
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
     console.log('Pedido excluído:', id);
     res.status(204).send();
-  } catch (err) {
-    console.error('Erro ao excluir pedido:', err.message, 'Stack:', err.stack);
-    res.status(500).json({ message: 'Erro ao excluir pedido', error: err.message, stack: err.stack });
+  } catch (error) {
+    console.error('Erro ao excluir pedido:', error.message, 'Stack:', error.stack);
+    res.status(500).json({ message: 'Erro ao excluir pedido', error: error.message, stack: error.stack });
   }
 });
 
