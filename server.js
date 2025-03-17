@@ -19,11 +19,11 @@ const formatDateToLocalISO = (date, context = 'unknown') => {
 };
 
 // Função auxiliar para calcular tempo entre duas datas
-const calcularTempo = (inicio, fim) => {
+const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
   const inicioDate = new Date(inicio);
   const fimDate = new Date(fim);
   if (isNaN(inicioDate) || isNaN(fimDate)) {
-    console.error('Data inválida em calcularTempo:', { inicio, fim });
+    console.warn('Data inválida em calcularTempo:', { inicio, fim });
     return 0;
   }
   const diffMs = fimDate - inicioDate;
