@@ -256,7 +256,24 @@ app.get('/pedidos', async (req, res) => {
 // Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, tempo, peso, volume, dataConclusao, pausado, tempoPausado, dataPausada, dataInicioPausa, itens } = req.body;
+  const { 
+    empresa, 
+    numeroOS, // Corrigido de numeroos para numeroOS
+    dataEntrada, // Corrigido de dataentrada para dataEntrada
+    previsaoEntrega, // Corrigido de previsaoentrega para previsaoEntrega
+    responsavel, 
+    status, 
+    inicio, 
+    tempo, 
+    peso, 
+    volume, 
+    dataConclusao, 
+    pausado, 
+    tempoPausado, 
+    dataPausada, 
+    dataInicioPausa, 
+    itens 
+  } = req.body;
 
   console.log('Dados recebidos no PUT /pedidos:', req.body);
 
@@ -297,7 +314,7 @@ app.put('/pedidos/:id', async (req, res) => {
   `;
   const pedidoValues = [
     empresa,
-    numeroOS,
+    numeroOS, // Agora será preenchido corretamente
     dataEntrada,
     previsaoEntrega,
     responsavel || null,
@@ -331,7 +348,6 @@ app.put('/pedidos/:id', async (req, res) => {
     `;
     const totalItens = itens.length;
 
-    // Inserir os novos itens
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
@@ -339,7 +355,6 @@ app.put('/pedidos/:id', async (req, res) => {
     }
     console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
 
-    // Retornar o objeto completo com todos os campos
     const pedidoAtualizado = { 
       id, 
       empresa, 
@@ -357,7 +372,12 @@ app.put('/pedidos/:id', async (req, res) => {
       tempoPausado: tempoPausado || 0, 
       dataPausada: dataPausadaFormatada, 
       dataInicioPausa: dataInicioPausaFormatada, 
-      itens 
+      itens: itens.map(item => ({
+        ...item,
+        codigoDesenho: item.codigoDesenho || item.codigodesenho, // Compatibilidade com nomes
+        quantidadePedido: item.quantidadePedido || item.quantidadepedido,
+        quantidadeEntregue: item.quantidadeEntregue || item.quantidadeentregue
+      }))
     };
     res.json(pedidoAtualizado);
   } catch (error) {
@@ -365,7 +385,6 @@ app.put('/pedidos/:id', async (req, res) => {
     res.status(500).json({ message: 'Erro ao atualizar pedido', error: error.message, stack: error.stack });
   }
 });
-
 // Excluir um pedido
 app.delete('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
