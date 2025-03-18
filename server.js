@@ -221,9 +221,9 @@ app.get('/pedidos', async (req, res) => {
       if (pedido.status === 'concluido') {
         tempoFinal = pedido.tempo;
       } else if (pedido.status === 'andamento') {
-        if (pedido.pausado) {
+        if (pedido.pausado === '1') { // Usa o valor do banco diretamente
           tempoFinal = pedido.tempoPausado || 0;
-        } else if (pedido.dataPausada && !pedido.pausado) {
+        } else if (pedido.dataPausada && pedido.pausado === '0') {
           const tempoAcumulado = pedido.tempoPausado || 0;
           const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
           tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
@@ -233,35 +233,34 @@ app.get('/pedidos', async (req, res) => {
       }
       return {
         ...pedido,
-        numeroOS: pedido.numeroos, // Mapeia numeroos para numeroOS
-        dataEntrada: pedido.dataentrada, // Mapeia dataentrada para dataEntrada
-        previsaoEntrega: pedido.previsaoentrega, // Mapeia previsaoentrega para previsaoEntrega
-        dataConclusao: pedido.dataconclusao, // Mapeia dataconclusao para dataConclusao
-        dataPausada: pedido.datapausada, // Mapeia datapausada para dataPausada
-        dataInicioPausa: pedido.datainiciopausa, // Mapeia datainiciopausa para dataInicioPausa
+        numeroOS: pedido.numeroos,
+        dataEntrada: pedido.dataentrada,
+        previsaoEntrega: pedido.previsaoentrega,
+        dataConclusao: pedido.dataconclusao,
+        dataPausada: pedido.datapausada,
+        dataInicioPausa: pedido.datainiciopausa,
         inicio: converterFormatoData(pedido.inicio),
         dataConclusao: pedido.dataconclusao ? converterFormatoData(pedido.dataconclusao) : null,
         dataPausada: pedido.datapausada ? converterFormatoData(pedido.datapausada) : null,
         dataInicioPausa: pedido.datainiciopausa ? converterFormatoData(pedido.datainiciopausa) : null,
         tempo: tempoFinal,
         tempoPausado: pedido.tempoPausado ? pedido.tempoPausado.toString() : '0',
-        pausado: pedido.pausado ? pedido.pausado.toString() : '0',
+        pausado: pedido.pausado ? pedido.pausado.toString() : '0', // Preserva o valor do banco
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
-          codigoDesenho: item.codigodesenho, // Mapeia codigodesenho para codigoDesenho
-          quantidadePedido: item.quantidadepedido, // Mapeia quantidadepedido para quantidadePedido
-          quantidadeEntregue: item.quantidadeentregue // Mapeia quantidadeentregue para quantidadeEntregue
+          codigoDesenho: item.codigodesenho,
+          quantidadePedido: item.quantidadepedido,
+          quantidadeEntregue: item.quantidadeentregue
         }))
       };
     });
-    console.log('Pedidos retornados:', pedidosComItens); // Adicionado aqui
+    console.log('Pedidos retornados:', pedidosComItens);
     res.json(pedidosComItens);
   } catch (err) {
     console.error('Erro ao listar pedidos:', err.message);
     res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
   }
-});
-// Atualizar um pedido com itens
+});// Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const { 
