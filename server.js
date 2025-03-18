@@ -313,10 +313,10 @@ app.put('/pedidos/:id', async (req, res) => {
     WHERE id = $16
   `;
   const pedidoValues = [
-    empresa,
-    numeroOS, // Agora será preenchido corretamente
-    dataEntrada,
-    previsaoEntrega,
+    empresa || null,
+    numeroOS || null,
+    dataEntrada || null,
+    previsaoEntrega || null,
     responsavel || null,
     status,
     inicioFormatado,
@@ -346,15 +346,16 @@ app.put('/pedidos/:id', async (req, res) => {
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
       VALUES ($1, $2, $3, $4)
     `;
-    const totalItens = itens.length;
+    const totalItens = itens ? itens.length : 0;
 
+    if (totalItens > 0) {
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
       await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
     }
     console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
-
+  }
     const pedidoAtualizado = { 
       id, 
       empresa, 
