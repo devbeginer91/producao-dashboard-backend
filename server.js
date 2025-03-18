@@ -254,6 +254,7 @@ app.get('/pedidos', async (req, res) => {
         }))
       };
     });
+    console.log('Pedidos retornados:', pedidosComItens); // Adicionado aqui
     res.json(pedidosComItens);
   } catch (err) {
     console.error('Erro ao listar pedidos:', err.message);
