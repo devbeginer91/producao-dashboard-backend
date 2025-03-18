@@ -233,17 +233,24 @@ app.get('/pedidos', async (req, res) => {
       }
       return {
         ...pedido,
+        numeroOS: pedido.numeroos, // Mapeia numeroos para numeroOS
+        dataEntrada: pedido.dataentrada, // Mapeia dataentrada para dataEntrada
+        previsaoEntrega: pedido.previsaoentrega, // Mapeia previsaoentrega para previsaoEntrega
+        dataConclusao: pedido.dataconclusao, // Mapeia dataconclusao para dataConclusao
+        dataPausada: pedido.datapausada, // Mapeia datapausada para dataPausada
+        dataInicioPausa: pedido.datainiciopausa, // Mapeia datainiciopausa para dataInicioPausa
         inicio: converterFormatoData(pedido.inicio),
-        dataConclusao: pedido.dataConclusao ? converterFormatoData(pedido.dataConclusao) : null,
-        dataPausada: pedido.dataPausada ? converterFormatoData(pedido.dataPausada) : null,
-        dataInicioPausa: pedido.dataInicioPausa ? converterFormatoData(pedido.dataInicioPausa) : null,
+        dataConclusao: pedido.dataconclusao ? converterFormatoData(pedido.dataconclusao) : null,
+        dataPausada: pedido.datapausada ? converterFormatoData(pedido.datapausada) : null,
+        dataInicioPausa: pedido.datainiciopausa ? converterFormatoData(pedido.datainiciopausa) : null,
         tempo: tempoFinal,
-        tempoPausado: pedido.tempoPausado ? pedido.tempoPausado.toString() : '0', // Converte para string
-        pausado: pedido.pausado ? pedido.pausado.toString() : '0', // Converte para string
+        tempoPausado: pedido.tempoPausado ? pedido.tempoPausado.toString() : '0',
+        pausado: pedido.pausado ? pedido.pausado.toString() : '0',
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
-          quantidadePedido: item.quantidadePedido ? item.quantidadePedido.toString() : '0', // Converte para string
-          quantidadeEntregue: item.quantidadeEntregue ? item.quantidadeEntregue.toString() : '0' // Converte para string
+          codigoDesenho: item.codigodesenho, // Mapeia codigodesenho para codigoDesenho
+          quantidadePedido: item.quantidadepedido, // Mapeia quantidadepedido para quantidadePedido
+          quantidadeEntregue: item.quantidadeentregue // Mapeia quantidadeentregue para quantidadeEntregue
         }))
       };
     });
