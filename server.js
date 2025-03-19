@@ -205,18 +205,16 @@ app.get('/pedidos', async (req, res) => {
     const pedidos = await db.all('SELECT * FROM pedidos');
     const itens = await db.all('SELECT * FROM itens_pedidos');
     const pedidosComItens = pedidos.map(pedido => {
-      let tempoFinal = Number(pedido.tempoPausado) || 0;
+      const tempoPausado = Number(pedido.tempopausado) || 0; // Garantir que seja número
+      let tempoFinal = tempoPausado;
       if (pedido.status === 'concluido') {
         tempoFinal = Number(pedido.tempo) || 0;
-      } else if (pedido.status === 'andamento') {
-        const tempoBase = Number(pedido.tempoPausado) || 0;
-        if (pedido.pausado !== '1') { // Se não está pausado
-          const dataReferencia = pedido.dataPausada || pedido.inicio;
-          const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
-          tempoFinal = tempoBase + tempoDecorrido;
-        }
+      } else if (pedido.status === 'andamento' && pedido.pausado !== '1') {
+        const dataReferencia = pedido.datapausada || pedido.inicio;
+        const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
+        tempoFinal = tempoPausado + tempoDecorrido;
       }
-      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${pedido.tempoPausado}, pausado = ${pedido.pausado}, inicio = ${pedido.inicio}, dataPausada = ${pedido.dataPausada}`);
+      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${tempoPausado}, pausado = ${pedido.pausado}, inicio = ${pedido.inicio}, dataPausada = ${pedido.datapausada}`);
       return {
         ...pedido,
         numeroOS: pedido.numeroos,
@@ -230,7 +228,7 @@ app.get('/pedidos', async (req, res) => {
         dataPausada: pedido.datapausada ? converterFormatoData(pedido.datapausada) : null,
         dataInicioPausa: pedido.datainiciopausa ? converterFormatoData(pedido.datainiciopausa) : null,
         tempo: tempoFinal,
-        tempoPausado: Number(pedido.tempoPausado) || 0,
+        tempoPausado: tempoPausado,
         pausado: pedido.pausado ? pedido.pausado.toString() : '0',
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
