@@ -210,9 +210,13 @@ app.get('/pedidos', async (req, res) => {
         tempoFinal = Number(pedido.tempo) || 0;
       } else if (pedido.status === 'andamento') {
         const tempoBase = Number(pedido.tempoPausado) || 0;
-        const dataReferencia = pedido.pausado === '1' ? pedido.inicio : (pedido.dataPausada || pedido.inicio);
-        const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
-        tempoFinal = pedido.pausado === '1' ? tempoBase : tempoBase + tempoDecorrido;
+        if (pedido.pausado === '1') {
+          tempoFinal = tempoBase; // Mantém o tempo pausado
+        } else {
+          const dataReferencia = pedido.dataPausada || pedido.inicio;
+          const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
+          tempoFinal = tempoBase + tempoDecorrido;
+        }
       }
       console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${pedido.tempoPausado}, pausado = ${pedido.pausado}, inicio = ${pedido.inicio}, dataPausada = ${pedido.dataPausada}`);
       return {
@@ -277,14 +281,7 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataPausadaFormatada = dataPausada ? converterFormatoData(dataPausada) : null;
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
-  let tempoFinal = Number(tempo) || 0;
-  if (pausado === 1) {
-    tempoFinal = Number(tempoPausado) || 0;
-  } else if (dataPausada && pausado === 0) {
-    const tempoAcumulado = Number(tempoPausado) || 0;
-    const tempoDesdeRetomada = calcularTempo(dataPausada, formatDateToLocalISO(new Date(), `retomarPedido - pedido ${id}`));
-    tempoFinal = tempoAcumulado + tempoDesdeRetomada;
-  }
+  const tempoFinal = Number(tempoPausado) || Number(tempo) || 0; // Usa tempoPausado como prioridade
 
   const pedidoSql = `
     UPDATE pedidos SET
