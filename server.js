@@ -138,6 +138,19 @@ const initializeDatabase = async () => {
       )
     `);
     console.log('Tabela itens_pedidos verificada/criada');
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS historico_entregas (
+        id SERIAL PRIMARY KEY,
+        pedido_id INTEGER,
+        item_id INTEGER,
+        quantidadeEntregue INTEGER NOT NULL,
+        dataEdicao TEXT NOT NULL,
+        FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE,
+        FOREIGN KEY (item_id) REFERENCES itens_pedidos(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('Tabela historico_entregas verificada/criada');
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -246,6 +259,18 @@ app.get('/pedidos', async (req, res) => {
   }
 });
 
+// Nova rota para buscar o histórico de entregas
+app.get('/historico-entregas/:pedidoId', async (req, res) => {
+  const pedidoId = parseInt(req.params.pedidoId);
+  try {
+    const historico = await db.all('SELECT * FROM historico_entregas WHERE pedido_id = $1', [pedidoId]);
+    res.json(historico);
+  } catch (error) {
+    console.error('Erro ao buscar histórico:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar histórico', error: error.message });
+  }
+});
+
 // Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
@@ -331,6 +356,11 @@ app.put('/pedidos/:id', async (req, res) => {
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
       VALUES ($1, $2, $3, $4)
+      RETURNING id
+    `;
+    const historicoSql = `
+      INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
+      VALUES ($1, $2, $3, $4)
     `;
     const totalItens = itens ? itens.length : 0;
 
@@ -338,7 +368,11 @@ app.put('/pedidos/:id', async (req, res) => {
       for (const item of itens) {
         const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
         console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
-        await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+        const itemResult = await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+        const itemId = itemResult.rows[0].id;
+        if (quantidadeEntregue > 0) {
+          await pool.query(historicoSql, [id, itemId, quantidadeEntregue, formatDateToLocalISO(new Date(), 'historico')]);
+        }
       }
       console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
     }
