@@ -210,9 +210,7 @@ app.get('/pedidos', async (req, res) => {
         tempoFinal = Number(pedido.tempo) || 0;
       } else if (pedido.status === 'andamento') {
         const tempoBase = Number(pedido.tempoPausado) || 0;
-        if (pedido.pausado === '1') {
-          tempoFinal = tempoBase; // Mantém o tempo pausado
-        } else {
+        if (pedido.pausado !== '1') { // Se não está pausado
           const dataReferencia = pedido.dataPausada || pedido.inicio;
           const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
           tempoFinal = tempoBase + tempoDecorrido;
@@ -281,7 +279,7 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataPausadaFormatada = dataPausada ? converterFormatoData(dataPausada) : null;
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
-  const tempoFinal = Number(tempoPausado) || Number(tempo) || 0; // Usa tempoPausado como prioridade
+  const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo); // Usa tempoPausado quando pausado
 
   const pedidoSql = `
     UPDATE pedidos SET
