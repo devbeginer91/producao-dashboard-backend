@@ -179,7 +179,7 @@ const montarEmail = (pedido, itens, observacao) => {
     - Status: ${pedido.status || 'Não informado'}
     - Início: ${pedido.inicio}
     ${pedido.dataConclusao ? `- Conclusão: ${pedido.dataConclusao}` : ''}
-    - Tempo (min): ${pedido.tempo ? pedido.tempo : 0}
+    - Tempo (min): ${pedido.tempo || 0}
     ${pedido.peso || pedido.volume ? `- Peso: ${pedido.peso || 'Não informado'}\n- Volume: ${pedido.volume || 'Não informado'}` : ''}
     - Pausado: ${pedido.pausado ? 'Sim' : 'Não'}
     - Tempo Pausado (min): ${pedido.tempoPausado || 0}
@@ -210,16 +210,11 @@ app.get('/pedidos', async (req, res) => {
         tempoFinal = Number(pedido.tempo) || 0;
       } else if (pedido.status === 'andamento') {
         const tempoBase = Number(pedido.tempoPausado) || 0;
-        if (pedido.pausado === '1') {
-          tempoFinal = tempoBase;
-        } else if (pedido.dataPausada && pedido.pausado === '0') {
-          const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
-          tempoFinal = tempoBase + tempoDesdeRetomada;
-        } else {
-          tempoFinal = tempoBase + calcularTempo(pedido.inicio);
-        }
+        const dataReferencia = pedido.pausado === '1' ? pedido.inicio : (pedido.dataPausada || pedido.inicio);
+        const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
+        tempoFinal = pedido.pausado === '1' ? tempoBase : tempoBase + tempoDecorrido;
       }
-      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${pedido.tempoPausado}, pausado = ${pedido.pausado}`);
+      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${pedido.tempoPausado}, pausado = ${pedido.pausado}, inicio = ${pedido.inicio}, dataPausada = ${pedido.dataPausada}`);
       return {
         ...pedido,
         numeroOS: pedido.numeroos,
@@ -233,7 +228,7 @@ app.get('/pedidos', async (req, res) => {
         dataPausada: pedido.datapausada ? converterFormatoData(pedido.datapausada) : null,
         dataInicioPausa: pedido.datainiciopausa ? converterFormatoData(pedido.datainiciopausa) : null,
         tempo: tempoFinal,
-        tempoPausado: pedido.tempoPausado ? Number(pedido.tempoPausado) : 0,
+        tempoPausado: Number(pedido.tempoPausado) || 0,
         pausado: pedido.pausado ? pedido.pausado.toString() : '0',
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
@@ -433,8 +428,8 @@ app.post('/pedidos', async (req, res) => {
   const inicioFormatado = converterFormatoData(inicio);
 
   const pedidoSql = `
-    INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, tempo, tempoPausado, pausado)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0)
     RETURNING id
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
@@ -472,6 +467,7 @@ app.post('/pedidos', async (req, res) => {
       pausado: '0', 
       itens 
     };
+    console.log('Novo pedido retornado:', novoPedido);
     res.status(201).json(novoPedido);
   } catch (error) {
     console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
