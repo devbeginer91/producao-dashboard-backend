@@ -302,7 +302,7 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataPausadaFormatada = dataPausada ? converterFormatoData(dataPausada) : null;
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
-  const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo); // Usa tempoPausado quando pausado
+  const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo);
 
   const pedidoSql = `
     UPDATE pedidos SET
@@ -371,7 +371,9 @@ app.put('/pedidos/:id', async (req, res) => {
         const itemResult = await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
         const itemId = itemResult.rows[0].id;
         if (quantidadeEntregue > 0) {
-          await pool.query(historicoSql, [id, itemId, quantidadeEntregue, formatDateToLocalISO(new Date(), 'historico')]);
+          const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+          console.log('Inserindo no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue, dataEdicao });
+          await pool.query(historicoSql, [id, itemId, quantidadeEntregue, dataEdicao]);
         }
       }
       console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
