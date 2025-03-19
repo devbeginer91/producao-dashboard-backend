@@ -27,12 +27,11 @@ const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
     return 0;
   }
   const diffMs = fimDate - inicioDate;
-  return diffMs < 0 ? 0 : diffMs / (1000 * 60); // Retorna em minutos
+  return diffMs < 0 ? 0 : Math.round(diffMs / (1000 * 60)); // Retorna em minutos, arredondado
 };
 
 // Middleware para Content-Security-Policy
 app.use((req, res, next) => {
-  // Ajustado para permitir conexões ao backend no Render
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://producao-dashboard-backend.onrender.com ws://producao-dashboard-frontend.onrender.com"
@@ -58,7 +57,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Conectar ao banco SQLite
+// Conectar ao banco PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://producao_dashboard_db_user:CiMFfDpnp8etmNOPpgVVELSwzTtHeJ12@dpg-cvc5vl3tq21c73dlt630-a.oregon-postgres.render.com/producao_dashboard_db',
   ssl: {
@@ -143,18 +142,6 @@ const initializeDatabase = async () => {
     console.error('Erro ao inicializar o banco:', err.message);
   }
 };
-// Função para executar uma query SQLite como Promise
-function runQuery(sql, params) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(this);
-      }
-    });
-  });
-}
 
 // Função para converter e validar formato de data para YYYY-MM-DD HH:MM:SS
 const converterFormatoData = (dataInput) => {
@@ -167,7 +154,7 @@ const converterFormatoData = (dataInput) => {
   if (isoFormatRegex.test(dataInput)) {
     const parsedDate = new Date(dataInput);
     if (!isNaN(parsedDate)) {
-      return dataInput; // Mantém o formato original se for válido
+      return dataInput;
     }
   }
 
@@ -192,9 +179,10 @@ const montarEmail = (pedido, itens, observacao) => {
     - Status: ${pedido.status || 'Não informado'}
     - Início: ${pedido.inicio}
     ${pedido.dataConclusao ? `- Conclusão: ${pedido.dataConclusao}` : ''}
-    - Tempo (h): ${pedido.tempo ? pedido.tempo.toFixed(2) : 0}
+    - Tempo (min): ${pedido.tempo ? pedido.tempo : 0}
     ${pedido.peso || pedido.volume ? `- Peso: ${pedido.peso || 'Não informado'}\n- Volume: ${pedido.volume || 'Não informado'}` : ''}
     - Pausado: ${pedido.pausado ? 'Sim' : 'Não'}
+    - Tempo Pausado (min): ${pedido.tempoPausado || 0}
     Itens:
     ${itens.map(item => `- Código: ${item.codigoDesenho}, Qtd Pedida: ${item.quantidadePedido}, Qtd Entregue: ${item.quantidadeEntregue}`).join('\n')}
   `;
@@ -217,20 +205,21 @@ app.get('/pedidos', async (req, res) => {
     const pedidos = await db.all('SELECT * FROM pedidos');
     const itens = await db.all('SELECT * FROM itens_pedidos');
     const pedidosComItens = pedidos.map(pedido => {
-      let tempoFinal = pedido.tempoPausado || 0;
+      let tempoFinal = Number(pedido.tempoPausado) || 0;
       if (pedido.status === 'concluido') {
-        tempoFinal = pedido.tempo;
+        tempoFinal = Number(pedido.tempo) || 0;
       } else if (pedido.status === 'andamento') {
-        if (pedido.pausado === '1') { // Usa o valor do banco diretamente
-          tempoFinal = pedido.tempoPausado || 0;
+        const tempoBase = Number(pedido.tempoPausado) || 0;
+        if (pedido.pausado === '1') {
+          tempoFinal = tempoBase;
         } else if (pedido.dataPausada && pedido.pausado === '0') {
-          const tempoAcumulado = pedido.tempoPausado || 0;
           const tempoDesdeRetomada = calcularTempo(pedido.dataPausada, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
-          tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
+          tempoFinal = tempoBase + tempoDesdeRetomada;
         } else {
-          tempoFinal = Math.round((pedido.tempoPausado || 0) + calcularTempo(pedido.inicio));
+          tempoFinal = tempoBase + calcularTempo(pedido.inicio);
         }
       }
+      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${pedido.tempoPausado}, pausado = ${pedido.pausado}`);
       return {
         ...pedido,
         numeroOS: pedido.numeroos,
@@ -244,8 +233,8 @@ app.get('/pedidos', async (req, res) => {
         dataPausada: pedido.datapausada ? converterFormatoData(pedido.datapausada) : null,
         dataInicioPausa: pedido.datainiciopausa ? converterFormatoData(pedido.datainiciopausa) : null,
         tempo: tempoFinal,
-        tempoPausado: pedido.tempoPausado ? pedido.tempoPausado.toString() : '0',
-        pausado: pedido.pausado ? pedido.pausado.toString() : '0', // Preserva o valor do banco
+        tempoPausado: pedido.tempoPausado ? Number(pedido.tempoPausado) : 0,
+        pausado: pedido.pausado ? pedido.pausado.toString() : '0',
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
           codigoDesenho: item.codigodesenho,
@@ -260,14 +249,16 @@ app.get('/pedidos', async (req, res) => {
     console.error('Erro ao listar pedidos:', err.message);
     res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
   }
-});// Atualizar um pedido com itens
+});
+
+// Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const { 
     empresa, 
-    numeroOS, // Corrigido de numeroos para numeroOS
-    dataEntrada, // Corrigido de dataentrada para dataEntrada
-    previsaoEntrega, // Corrigido de previsaoentrega para previsaoEntrega
+    numeroOS,
+    dataEntrada,
+    previsaoEntrega,
     responsavel, 
     status, 
     inicio, 
@@ -291,13 +282,13 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataPausadaFormatada = dataPausada ? converterFormatoData(dataPausada) : null;
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
-  let tempoFinal = tempo || 0;
+  let tempoFinal = Number(tempo) || 0;
   if (pausado === 1) {
-    tempoFinal = tempoPausado || tempo || 0;
+    tempoFinal = Number(tempoPausado) || 0;
   } else if (dataPausada && pausado === 0) {
-    const tempoAcumulado = tempoPausado || 0;
+    const tempoAcumulado = Number(tempoPausado) || 0;
     const tempoDesdeRetomada = calcularTempo(dataPausada, formatDateToLocalISO(new Date(), `retomarPedido - pedido ${id}`));
-    tempoFinal = Math.round(tempoAcumulado + tempoDesdeRetomada);
+    tempoFinal = tempoAcumulado + tempoDesdeRetomada;
   }
 
   const pedidoSql = `
@@ -332,7 +323,7 @@ app.put('/pedidos/:id', async (req, res) => {
     volume || null,
     dataConclusaoFormatada,
     pausado || 0,
-    tempoPausado || 0,
+    Number(tempoPausado) || 0,
     dataPausadaFormatada,
     dataInicioPausaFormatada,
     id
@@ -356,13 +347,14 @@ app.put('/pedidos/:id', async (req, res) => {
     const totalItens = itens ? itens.length : 0;
 
     if (totalItens > 0) {
-    for (const item of itens) {
-      const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-      console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
-      await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      for (const item of itens) {
+        const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
+        await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      }
+      console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
     }
-    console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
-  }
+
     const pedidoAtualizado = { 
       id, 
       empresa, 
@@ -372,27 +364,29 @@ app.put('/pedidos/:id', async (req, res) => {
       responsavel, 
       status, 
       inicio: inicioFormatado, 
-      tempo: tempoFinal, 
+      tempo: tempoFinal,
       peso, 
       volume, 
       dataConclusao: dataConclusaoFormatada, 
       pausado: pausado || 0, 
-      tempoPausado: tempoPausado || 0, 
+      tempoPausado: Number(tempoPausado) || 0, 
       dataPausada: dataPausadaFormatada, 
       dataInicioPausa: dataInicioPausaFormatada, 
-      itens: itens.map(item => ({
+      itens: itens ? itens.map(item => ({
         ...item,
-        codigoDesenho: item.codigoDesenho || item.codigodesenho, // Compatibilidade com nomes
+        codigoDesenho: item.codigoDesenho || item.codigodesenho,
         quantidadePedido: item.quantidadePedido || item.quantidadepedido,
         quantidadeEntregue: item.quantidadeEntregue || item.quantidadeentregue
-      }))
+      })) : []
     };
+    console.log('Pedido atualizado retornado:', pedidoAtualizado);
     res.json(pedidoAtualizado);
   } catch (error) {
     console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao atualizar pedido', error: error.message, stack: error.stack });
   }
 });
+
 // Excluir um pedido
 app.delete('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
@@ -411,7 +405,8 @@ app.delete('/pedidos/:id', async (req, res) => {
     res.status(500).json({ message: 'Erro ao excluir pedido', error: error.message, stack: error.stack });
   }
 });
-///POST /PEDIDOS
+
+// Criar um novo pedido
 app.post('/pedidos', async (req, res) => {
   const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
 
@@ -443,7 +438,7 @@ app.post('/pedidos', async (req, res) => {
     RETURNING id
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
-  console.log('Recebendo POST /pedidos');
+
   try {
     console.log('Inserindo pedido principal com valores:', pedidoValues);
     const result = await pool.query(pedidoSql, pedidoValues);
@@ -456,11 +451,6 @@ app.post('/pedidos', async (req, res) => {
     `;
     const totalItens = itens.length;
 
-    if (totalItens === 0) {
-      const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens: [] };
-      return res.status(201).json(novoPedido);
-    }
-
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
@@ -468,7 +458,20 @@ app.post('/pedidos', async (req, res) => {
     }
     console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
 
-    const novoPedido = { id: pedidoId, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio: inicioFormatado, itens };
+    const novoPedido = { 
+      id: pedidoId, 
+      empresa, 
+      numeroOS, 
+      dataEntrada, 
+      previsaoEntrega, 
+      responsavel, 
+      status, 
+      inicio: inicioFormatado, 
+      tempo: 0, 
+      tempoPausado: 0, 
+      pausado: '0', 
+      itens 
+    };
     res.status(201).json(novoPedido);
   } catch (error) {
     console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
@@ -487,7 +490,6 @@ app.post('/enviar-email', async (req, res) => {
     return res.status(400).json({ message: 'Dados do pedido inválidos ou número da OS não fornecido' });
   }
 
-  // Valida e corrige o campo inicio antes de enviar o e-mail
   const pedidoFormatado = {
     ...pedido,
     inicio: converterFormatoData(pedido.inicio),
