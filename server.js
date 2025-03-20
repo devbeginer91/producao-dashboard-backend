@@ -142,6 +142,17 @@ const initializeDatabase = async () => {
       )
     `);
     console.log('Tabela historico_entregas verificada/criada');
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS historico_observacoes (
+        id SERIAL PRIMARY KEY,
+        pedido_id INTEGER,
+        observacao TEXT NOT NULL,
+        dataEdicao TEXT NOT NULL,
+        FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
+      )
+    `);
+    console.log('Tabela historico_observacoes verificada/criada');
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -264,6 +275,26 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
   } catch (error) {
     console.error(`Erro ao buscar histórico para pedido ${pedidoId}:`, error.message);
     res.status(500).json({ message: 'Erro ao buscar histórico', error: error.message });
+  }
+});
+
+app.get('/historico-observacoes/:pedidoId', async (req, res) => {
+  const pedidoId = parseInt(req.params.pedidoId);
+  try {
+    console.log(`Executando query para histórico de observações do pedido ${pedidoId}`);
+    const historico = await db.all(`
+      SELECT * FROM historico_observacoes 
+      WHERE pedido_id = $1
+      ORDER BY dataEdicao ASC
+    `, [pedidoId]);
+    console.log(`GET /historico-observacoes/${pedidoId} - Resultado da query:`, historico);
+    if (!historico || historico.length === 0) {
+      console.log(`Nenhum registro de observações encontrado para pedido ${pedidoId}`);
+    }
+    res.json(historico);
+  } catch (error) {
+    console.error(`Erro ao buscar histórico de observações para pedido ${pedidoId}:`, error.message);
+    res.status(500).json({ message: 'Erro ao buscar histórico de observações', error: error.message });
   }
 });
 
@@ -531,6 +562,18 @@ app.post('/enviar-email', async (req, res) => {
   try {
     const info = await transporter.sendMail(mailOptions);
     console.log('E-mail enviado:', info.response);
+
+    // Salvar observação no histórico, se houver
+    if (observacao && observacao.trim()) {
+      const dataEdicao = formatDateToLocalISO(new Date(), 'historico_observacao');
+      const observacaoSql = `
+        INSERT INTO historico_observacoes (pedido_id, observacao, dataEdicao)
+        VALUES ($1, $2, $3)
+      `;
+      await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
+      console.log(`Observação salva no histórico para pedido ${pedido.id}:`, { observacao, dataEdicao });
+    }
+
     res.status(200).json({ message: 'E-mail enviado com sucesso' });
   } catch (error) {
     console.error('Erro ao enviar e-mail:', error.message, 'Stack:', error.stack);
