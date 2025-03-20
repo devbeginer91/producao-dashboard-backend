@@ -490,7 +490,7 @@ app.delete('/pedidos/:id', async (req, res) => {
 app.post('/pedidos', async (req, res) => {
   const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
 
-  console.log('Dados recebidos no POST /pedidos:', { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status });
+  console.log('Dados recebidos no POST /pedidos:', { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens });
 
   if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
     console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
@@ -519,15 +519,23 @@ app.post('/pedidos', async (req, res) => {
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
 
+  const client = await pool.connect(); // Iniciar uma transação
+
   try {
+    await client.query('BEGIN'); // Iniciar a transação
+
     console.log('Inserindo pedido principal com valores:', pedidoValues);
-    const result = await pool.query(pedidoSql, pedidoValues);
-    const pedidoId = result.rows[0].id;
+    const result = await client.query(pedidoSql, pedidoValues);
+    const pedidoId = result.rows[0]?.id;
+    if (!pedidoId) {
+      throw new Error('Falha ao inserir pedido: ID não retornado');
+    }
     console.log('Pedido inserido com ID:', pedidoId);
 
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
       VALUES ($1, $2, $3, $4)
+      RETURNING id
     `;
     const historicoSql = `
       INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
@@ -539,18 +547,24 @@ app.post('/pedidos', async (req, res) => {
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
-      const itemResult = await pool.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      const itemResult = await client.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      console.log('Resultado da inserção do item:', itemResult);
+      if (!itemResult.rows || itemResult.rows.length === 0) {
+        throw new Error('Falha ao inserir item: Nenhum ID retornado');
+      }
       const itemId = itemResult.rows[0].id;
       if (quantidadeEntregue > 0) {
         const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
         console.log('Tentando inserir no histórico:', { pedido_id: pedidoId, item_id: itemId, quantidadeEntregue, dataEdicao });
-        const historicoResult = await pool.query(historicoSql, [pedidoId, itemId, quantidadeEntregue, dataEdicao]);
+        const historicoResult = await client.query(historicoSql, [pedidoId, itemId, quantidadeEntregue, dataEdicao]);
         console.log('Registro inserido no histórico:', historicoResult.rows[0]);
       } else {
         console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemId);
       }
     }
     console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
+
+    await client.query('COMMIT'); // Confirmar a transação
 
     const novoPedido = { 
       id: pedidoId, 
@@ -569,8 +583,11 @@ app.post('/pedidos', async (req, res) => {
     console.log('Novo pedido retornado:', novoPedido);
     res.status(201).json(novoPedido);
   } catch (error) {
+    await client.query('ROLLBACK'); // Reverter a transação em caso de erro
     console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao processar pedido', error: error.message, stack: error.stack });
+  } finally {
+    client.release(); // Liberar o cliente da pool
   }
 });
 
