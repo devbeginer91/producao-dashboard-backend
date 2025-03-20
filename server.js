@@ -6,7 +6,6 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Função para formatar datas no formato YYYY-MM-DD HH:MM:SS com fuso horário America/Sao_Paulo (UTC-3)
 const formatDateToLocalISO = (date, context = 'unknown') => {
   const d = date ? new Date(date) : new Date();
   if (isNaN(d.getTime()) || (typeof date === 'string' && date.includes('undefined'))) {
@@ -18,7 +17,6 @@ const formatDateToLocalISO = (date, context = 'unknown') => {
   return isoString;
 };
 
-// Função auxiliar para calcular tempo entre duas datas
 const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
   const inicioDate = new Date(inicio);
   const fimDate = new Date(fim);
@@ -27,10 +25,9 @@ const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
     return 0;
   }
   const diffMs = fimDate - inicioDate;
-  return diffMs < 0 ? 0 : Math.round(diffMs / (1000 * 60)); // Retorna em minutos, arredondado
+  return diffMs < 0 ? 0 : Math.round(diffMs / (1000 * 60));
 };
 
-// Middleware para Content-Security-Policy
 app.use((req, res, next) => {
   res.setHeader(
     "Content-Security-Policy",
@@ -46,23 +43,18 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Rota padrão para a raiz
 app.get('/', (req, res) => {
   res.send('Backend do Controle de Produção está ativo! Acesse a API em /pedidos ou o frontend em /dashboard.');
 });
 
-// Middleware para log de requisições
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Body:`, req.body);
   next();
 });
 
-// Conectar ao banco PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://producao_dashboard_db_user:CiMFfDpnp8etmNOPpgVVELSwzTtHeJ12@dpg-cvc5vl3tq21c73dlt630-a.oregon-postgres.render.com/producao_dashboard_db',
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: { rejectUnauthorized: false }
 });
 
 pool.connect((err) => {
@@ -102,7 +94,6 @@ const db = {
   }
 };
 
-// Função para inicializar o banco de dados
 const initializeDatabase = async () => {
   try {
     await db.run(`
@@ -156,7 +147,6 @@ const initializeDatabase = async () => {
   }
 };
 
-// Função para converter e validar formato de data para YYYY-MM-DD HH:MM:SS
 const converterFormatoData = (dataInput) => {
   if (!dataInput || typeof dataInput !== 'string' || dataInput.includes('undefined')) {
     console.warn('Data inválida fornecida, usando data atual:', dataInput);
@@ -180,7 +170,6 @@ const converterFormatoData = (dataInput) => {
   return new Date().toISOString().slice(0, 19).replace('T', ' ');
 };
 
-// Função para montar o corpo do e-mail
 const montarEmail = (pedido, itens, observacao) => {
   const detalhesPedido = `
     Detalhes do Pedido:
@@ -203,7 +192,6 @@ const montarEmail = (pedido, itens, observacao) => {
   return `${observacaoText}${detalhesPedido}`.trim();
 };
 
-// Configuração do Nodemailer
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -212,13 +200,12 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Listar todos os pedidos com itens
 app.get('/pedidos', async (req, res) => {
   try {
     const pedidos = await db.all('SELECT * FROM pedidos');
     const itens = await db.all('SELECT * FROM itens_pedidos');
     const pedidosComItens = pedidos.map(pedido => {
-      const tempoPausado = Number(pedido.tempopausado) || 0; // Garantir que seja número
+      const tempoPausado = Number(pedido.tempopausado) || 0;
       let tempoFinal = tempoPausado;
       if (pedido.status === 'concluido') {
         tempoFinal = Number(pedido.tempo) || 0;
@@ -259,19 +246,18 @@ app.get('/pedidos', async (req, res) => {
   }
 });
 
-// Nova rota para buscar o histórico de entregas
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
     const historico = await db.all('SELECT * FROM historico_entregas WHERE pedido_id = $1', [pedidoId]);
+    console.log(`GET /historico-entregas/${pedidoId} - Histórico retornado:`, historico);
     res.json(historico);
   } catch (error) {
-    console.error('Erro ao buscar histórico:', error.message);
+    console.error(`Erro ao buscar histórico para pedido ${pedidoId}:`, error.message);
     res.status(500).json({ message: 'Erro ao buscar histórico', error: error.message });
   }
 });
 
-// Atualizar um pedido com itens
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const { 
@@ -293,7 +279,7 @@ app.put('/pedidos/:id', async (req, res) => {
     itens 
   } = req.body;
 
-  console.log('Dados recebidos no PUT /pedidos:', req.body);
+  console.log('Dados recebidos no PUT /pedidos:', { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status });
 
   const inicioFormatado = converterFormatoData(inicio);
   const dataConclusaoFormatada = status === 'concluido' && !dataConclusao
@@ -361,6 +347,7 @@ app.put('/pedidos/:id', async (req, res) => {
     const historicoSql = `
       INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
       VALUES ($1, $2, $3, $4)
+      RETURNING *
     `;
     const totalItens = itens ? itens.length : 0;
 
@@ -372,8 +359,11 @@ app.put('/pedidos/:id', async (req, res) => {
         const itemId = itemResult.rows[0].id;
         if (quantidadeEntregue > 0) {
           const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-          console.log('Inserindo no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue, dataEdicao });
-          await pool.query(historicoSql, [id, itemId, quantidadeEntregue, dataEdicao]);
+          console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue, dataEdicao });
+          const historicoResult = await pool.query(historicoSql, [id, itemId, quantidadeEntregue, dataEdicao]);
+          console.log('Registro inserido no histórico:', historicoResult.rows[0]);
+        } else {
+          console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemId);
         }
       }
       console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
@@ -411,7 +401,6 @@ app.put('/pedidos/:id', async (req, res) => {
   }
 });
 
-// Excluir um pedido
 app.delete('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
@@ -430,11 +419,10 @@ app.delete('/pedidos/:id', async (req, res) => {
   }
 });
 
-// Criar um novo pedido
 app.post('/pedidos', async (req, res) => {
   const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
 
-  console.log('Dados recebidos no POST /pedidos:', req.body);
+  console.log('Dados recebidos no POST /pedidos:', { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status });
 
   if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
     console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
@@ -504,7 +492,6 @@ app.post('/pedidos', async (req, res) => {
   }
 });
 
-// Enviar e-mail
 app.post('/enviar-email', async (req, res) => {
   const { pedido, observacao } = req.body;
 
@@ -542,7 +529,6 @@ app.post('/enviar-email', async (req, res) => {
   }
 });
 
-// Iniciar o servidor
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
