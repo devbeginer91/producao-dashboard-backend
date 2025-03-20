@@ -330,142 +330,162 @@ app.put('/pedidos/:id', async (req, res) => {
 
   const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo);
 
-  const pedidoSql = `
-    UPDATE pedidos SET
-      empresa = $1,
-      numeroOS = $2,
-      dataEntrada = $3,
-      previsaoEntrega = $4,
-      responsavel = $5,
-      status = $6,
-      inicio = $7,
-      tempo = $8,
-      peso = $9,
-      volume = $10,
-      dataConclusao = $11,
-      pausado = $12,
-      tempoPausado = $13,
-      dataPausada = $14,
-      dataInicioPausa = $15
-    WHERE id = $16
-  `;
-  const pedidoValues = [
-    empresa || null,
-    numeroOS || null,
-    dataEntrada || null,
-    previsaoEntrega || null,
-    responsavel || null,
-    status,
-    inicioFormatado,
-    tempoFinal,
-    peso || null,
-    volume || null,
-    dataConclusaoFormatada,
-    pausado || 0,
-    Number(tempoPausado) || 0,
-    dataPausadaFormatada,
-    dataInicioPausaFormatada,
-    id
-  ];
+  const client = await pool.connect(); // Iniciar uma transação
 
   try {
-    console.log('Atualizando pedido com valores:', pedidoValues);
-    const result = await pool.query(pedidoSql, pedidoValues);
-    if (result.rowCount === 0) {
-      console.error('Pedido não encontrado:', id);
-      return res.status(404).json({ message: 'Pedido não encontrado' });
-    }
+    await client.query('BEGIN'); // Iniciar a transação
 
-    // Buscar os itens atuais do pedido para calcular as diferenças
-    const itensAtuais = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [id]);
-    const itensAtuaisMap = new Map(itensAtuais.map(item => [item.id, item]));
-
-    const itemSql = `
-      INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id
-    `;
-    const updateItemSql = `
-      UPDATE itens_pedidos
-      SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3
-      WHERE id = $4
-    `;
-    const historicoSql = `
-      INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
-      VALUES ($1, $2, $3, $4)
+    // Atualizar o pedido
+    const pedidoSql = `
+      UPDATE pedidos SET
+        empresa = $1,
+        numeroOS = $2,
+        dataEntrada = $3,
+        previsaoEntrega = $4,
+        responsavel = $5,
+        status = $6,
+        inicio = $7,
+        tempo = $8,
+        peso = $9,
+        volume = $10,
+        dataConclusao = $11,
+        pausado = $12,
+        tempoPausado = $13,
+        dataPausada = $14,
+        dataInicioPausa = $15
+      WHERE id = $16
       RETURNING *
     `;
-    const totalItens = itens ? itens.length : 0;
+    const pedidoValues = [
+      empresa || null,
+      numeroOS || null,
+      dataEntrada || null,
+      previsaoEntrega || null,
+      responsavel || null,
+      status,
+      inicioFormatado,
+      tempoFinal,
+      peso || null,
+      volume || null,
+      dataConclusaoFormatada,
+      pausado || 0,
+      Number(tempoPausado) || 0,
+      dataPausadaFormatada,
+      dataInicioPausaFormatada,
+      id
+    ];
 
-    if (totalItens > 0) {
-      for (const item of itens) {
-        const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-        let itemIdToUse = itemId;
+    console.log('Atualizando pedido com valores:', pedidoValues);
+    const result = await client.query(pedidoSql, pedidoValues);
+    if (result.rows.length === 0) {
+      console.error('Pedido não encontrado:', id);
+      throw new Error('Pedido não encontrado');
+    }
+    const pedidoAtualizado = result.rows[0];
+    console.log(`Pedido ${id} atualizado:`, pedidoAtualizado);
 
-        if (itemId && itensAtuaisMap.has(itemId)) {
-          // Item existente, atualizar
-          const itemAtual = itensAtuaisMap.get(itemId);
-          const quantidadeEntregueAnterior = itemAtual.quantidadeentregue || 0;
-          const quantidadeAdicionada = (quantidadeEntregue || 0) - quantidadeEntregueAnterior;
+    // Se o status for 'concluido', zerar o saldo dos itens (quantidadeEntregue = quantidadePedido)
+    if (status === 'concluido') {
+      console.log(`Status do pedido ${id} é 'concluido'. Zerando saldo dos itens...`);
+      const updateItensSql = `
+        UPDATE itens_pedidos
+        SET quantidadeEntregue = quantidadePedido
+        WHERE pedido_id = $1
+        RETURNING *
+      `;
+      const itensResult = await client.query(updateItensSql, [id]);
+      console.log(`Itens do pedido ${id} atualizados:`, itensResult.rows);
 
-          await pool.query(updateItemSql, [codigoDesenho, quantidadePedido, quantidadeEntregue || 0, itemId]);
-
-          if (quantidadeAdicionada > 0) {
-            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-            console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue: quantidadeAdicionada, dataEdicao });
-            const historicoResult = await pool.query(historicoSql, [id, itemId, quantidadeAdicionada, dataEdicao]);
-            console.log('Registro inserido no histórico:', historicoResult.rows[0]);
-          } else {
-            console.log('Quantidade adicionada é 0 ou negativa, pulando inserção no histórico para item:', itemId);
-          }
-        } else {
-          // Novo item, inserir
-          console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
-          const itemResult = await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
-          itemIdToUse = itemResult.rows[0].id;
-
-          if (quantidadeEntregue > 0) {
-            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-            console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemIdToUse, quantidadeEntregue, dataEdicao });
-            const historicoResult = await pool.query(historicoSql, [id, itemIdToUse, quantidadeEntregue, dataEdicao]);
-            console.log('Registro inserido no histórico:', historicoResult.rows[0]);
-          } else {
-            console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemIdToUse);
-          }
+      // Registrar no histórico de entregas
+      const historicoSql = `
+        INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+      `;
+      const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+      for (const item of itensResult.rows) {
+        const quantidadeEntregue = item.quantidadepedido; // Como zeramos o saldo, a quantidade entregue é igual à pedida
+        if (quantidadeEntregue > 0) {
+          const historicoResult = await client.query(historicoSql, [id, item.id, quantidadeEntregue, dataEdicao]);
+          console.log(`Registro inserido no histórico para item ${item.id}:`, historicoResult.rows[0]);
         }
       }
-      console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
     }
 
-    const pedidoAtualizado = { 
-      id, 
-      empresa, 
-      numeroOS, 
-      dataEntrada, 
-      previsaoEntrega, 
-      responsavel, 
-      status, 
-      inicio: inicioFormatado, 
+    // Atualizar os itens do pedido, se fornecidos
+    if (itens && Array.isArray(itens)) {
+      const totalItens = itens.length;
+      console.log(`Atualizando ${totalItens} itens para o pedido ${id}`);
+      const itemSql = `
+        UPDATE itens_pedidos
+        SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3
+        WHERE pedido_id = $4 AND id = $5
+        RETURNING *
+      `;
+      const historicoSql = `
+        INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+      `;
+      for (const item of itens) {
+        if (!item.id) continue; // Pular itens sem ID (novos itens não devem ser atualizados aqui)
+        const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        const itemResult = await client.query(itemSql, [
+          codigoDesenho,
+          quantidadePedido,
+          quantidadeEntregue || 0,
+          id,
+          item.id
+        ]);
+        if (itemResult.rows.length === 0) {
+          console.warn(`Item ${item.id} não encontrado para o pedido ${id}, pulando...`);
+          continue;
+        }
+        const updatedItem = itemResult.rows[0];
+        if (quantidadeEntregue > 0) {
+          const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+          const historicoResult = await client.query(historicoSql, [
+            id,
+            updatedItem.id,
+            quantidadeEntregue,
+            dataEdicao
+          ]);
+          console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
+        }
+      }
+    }
+
+    await client.query('COMMIT'); // Confirmar transação
+
+    // Buscar os itens atualizados do pedido para retornar
+    const itensSql = 'SELECT * FROM itens_pedidos WHERE pedido_id = $1';
+    const itensResult = await client.query(itensSql, [id]);
+    const pedidoComItens = { 
+      ...pedidoAtualizado, 
+      numeroOS: pedidoAtualizado.numeroos,
+      dataEntrada: pedidoAtualizado.dataentrada,
+      previsaoEntrega: pedidoAtualizado.previsaoentrega,
+      dataConclusao: pedidoAtualizado.dataconclusao,
+      dataPausada: pedidoAtualizado.datapausada,
+      dataInicioPausa: pedidoAtualizado.datainiciopausa,
       tempo: tempoFinal,
-      peso, 
-      volume, 
-      dataConclusao: dataConclusaoFormatada, 
-      pausado: pausado || 0, 
-      tempoPausado: Number(tempoPausado) || 0, 
-      dataPausada: dataPausadaFormatada, 
-      dataInicioPausa: dataInicioPausaFormatada, 
-      itens: itens ? itens.map(item => ({
+      tempoPausado: Number(tempoPausado) || 0,
+      pausado: pausado || '0',
+      itens: itensResult.rows.map(item => ({
         ...item,
-        codigoDesenho: item.codigoDesenho || item.codigodesenho,
-        quantidadePedido: item.quantidadePedido || item.quantidadepedido,
-        quantidadeEntregue: item.quantidadeEntregue || item.quantidadeentregue
-      })) : []
+        codigoDesenho: item.codigodesenho,
+        quantidadePedido: item.quantidadepedido,
+        quantidadeEntregue: item.quantidadeentregue
+      }))
     };
-    console.log('Pedido atualizado retornado:', pedidoAtualizado);
-    res.json(pedidoAtualizado);
+    console.log('Pedido atualizado retornado:', pedidoComItens);
+    res.status(200).json(pedidoComItens);
   } catch (error) {
+    await client.query('ROLLBACK'); // Reverter transação em caso de erro
     console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao atualizar pedido', error: error.message, stack: error.stack });
+  } finally {
+    client.release();
   }
 });
 
