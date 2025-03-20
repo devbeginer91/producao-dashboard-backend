@@ -563,7 +563,6 @@ app.post('/enviar-email', async (req, res) => {
     const info = await transporter.sendMail(mailOptions);
     console.log('E-mail enviado:', info.response);
 
-    // Salvar observação no histórico, se houver
     if (observacao && observacao.trim()) {
       const dataEdicao = formatDateToLocalISO(new Date(), 'historico_observacao');
       const observacaoSql = `
