@@ -2,9 +2,40 @@ const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
+const WebSocket = require('ws'); // Adicionando WebSocket
 require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Configuração do WebSocket Server
+const wss = new WebSocket.Server({ port: 8080 }); // Porta separada para WebSocket
+
+// Lista de clientes conectados
+const clients = new Set();
+
+wss.on('connection', (ws) => {
+  console.log('Novo cliente conectado via WebSocket');
+  clients.add(ws);
+
+  ws.on('close', () => {
+    console.log('Cliente desconectado');
+    clients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('Erro no WebSocket:', error);
+    clients.delete(ws);
+  });
+});
+
+// Função para notificar todos os clientes conectados
+const notifyClients = (message) => {
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
+    }
+  });
+};
 
 const formatDateToLocalISO = (date, context = 'unknown') => {
   const d = date ? new Date(date) : new Date();
@@ -31,7 +62,7 @@ const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
 app.use((req, res, next) => {
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://producao-dashboard-backend.onrender.com ws://producao-dashboard-frontend.onrender.com"
+    "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://producao-dashboard-backend.onrender.com ws://producao-dashboard-backend.onrender.com:8080 wss://producao-dashboard-backend.onrender.com:8080;"
   );
   next();
 });
@@ -253,7 +284,7 @@ app.get('/pedidos', async (req, res) => {
     res.json(pedidosComItens);
   } catch (err) {
     console.error('Erro ao listar pedidos:', err.message);
-    res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
+    res.status(500).json({ message: 'Erro ao listar pedido', error: err.message });
   }
 });
 
@@ -462,6 +493,10 @@ app.put('/pedidos/:id', async (req, res) => {
       })) : []
     };
     console.log('Pedido atualizado retornado:', pedidoAtualizado);
+
+    // Notificar todos os clientes conectados sobre a atualização do pedido
+    notifyClients({ type: 'PEDIDO_ATUALIZADO', pedido: pedidoAtualizado });
+
     res.json(pedidoAtualizado);
   } catch (error) {
     console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
@@ -480,6 +515,10 @@ app.delete('/pedidos/:id', async (req, res) => {
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
     console.log('Pedido excluído:', id);
+
+    // Notificar todos os clientes conectados sobre a exclusão do pedido
+    notifyClients({ type: 'PEDIDO_EXCLUIDO', pedidoId: id });
+
     res.status(204).send();
   } catch (error) {
     console.error('Erro ao excluir pedido:', error.message, 'Stack:', error.stack);
@@ -567,6 +606,10 @@ app.post('/pedidos', async (req, res) => {
       itens 
     };
     console.log('Novo pedido retornado:', novoPedido);
+
+    // Notificar todos os clientes conectados sobre o novo pedido
+    notifyClients({ type: 'NOVO_PEDIDO', pedido: novoPedido });
+
     res.status(201).json(novoPedido);
   } catch (error) {
     console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
@@ -613,6 +656,9 @@ app.post('/enviar-email', async (req, res) => {
       `;
       await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
       console.log(`Observação salva no histórico para pedido ${pedido.id}:`, { observacao, dataEdicao });
+
+      // Notificar todos os clientes conectados sobre a nova observação
+      notifyClients({ type: 'NOVA_OBSERVACAO', pedidoId: pedido.id, observacao, dataEdicao });
     }
 
     res.status(200).json({ message: 'E-mail enviado com sucesso' });
