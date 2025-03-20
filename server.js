@@ -376,13 +376,19 @@ app.put('/pedidos/:id', async (req, res) => {
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
 
-    console.log('Deletando itens antigos para pedido_id:', id);
-    await pool.query('DELETE FROM itens_pedidos WHERE pedido_id = $1', [id]);
+    // Buscar os itens atuais do pedido para calcular as diferenças
+    const itensAtuais = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [id]);
+    const itensAtuaisMap = new Map(itensAtuais.map(item => [item.id, item]));
 
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
       VALUES ($1, $2, $3, $4)
       RETURNING id
+    `;
+    const updateItemSql = `
+      UPDATE itens_pedidos
+      SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3
+      WHERE id = $4
     `;
     const historicoSql = `
       INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
@@ -393,17 +399,39 @@ app.put('/pedidos/:id', async (req, res) => {
 
     if (totalItens > 0) {
       for (const item of itens) {
-        const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-        console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
-        const itemResult = await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
-        const itemId = itemResult.rows[0].id;
-        if (quantidadeEntregue > 0) {
-          const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-          console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue, dataEdicao });
-          const historicoResult = await pool.query(historicoSql, [id, itemId, quantidadeEntregue, dataEdicao]);
-          console.log('Registro inserido no histórico:', historicoResult.rows[0]);
+        const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        let itemIdToUse = itemId;
+
+        if (itemId && itensAtuaisMap.has(itemId)) {
+          // Item existente, atualizar
+          const itemAtual = itensAtuaisMap.get(itemId);
+          const quantidadeEntregueAnterior = itemAtual.quantidadeentregue || 0;
+          const quantidadeAdicionada = (quantidadeEntregue || 0) - quantidadeEntregueAnterior;
+
+          await pool.query(updateItemSql, [codigoDesenho, quantidadePedido, quantidadeEntregue || 0, itemId]);
+
+          if (quantidadeAdicionada > 0) {
+            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+            console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemId, quantidadeEntregue: quantidadeAdicionada, dataEdicao });
+            const historicoResult = await pool.query(historicoSql, [id, itemId, quantidadeAdicionada, dataEdicao]);
+            console.log('Registro inserido no histórico:', historicoResult.rows[0]);
+          } else {
+            console.log('Quantidade adicionada é 0 ou negativa, pulando inserção no histórico para item:', itemId);
+          }
         } else {
-          console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemId);
+          // Novo item, inserir
+          console.log('Inserindo item:', { pedido_id: id, codigoDesenho, quantidadePedido, quantidadeEntregue });
+          const itemResult = await pool.query(itemSql, [id, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+          itemIdToUse = itemResult.rows[0].id;
+
+          if (quantidadeEntregue > 0) {
+            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+            console.log('Tentando inserir no histórico:', { pedido_id: id, item_id: itemIdToUse, quantidadeEntregue, dataEdicao });
+            const historicoResult = await pool.query(historicoSql, [id, itemIdToUse, quantidadeEntregue, dataEdicao]);
+            console.log('Registro inserido no histórico:', historicoResult.rows[0]);
+          } else {
+            console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemIdToUse);
+          }
         }
       }
       console.log(`Todos os ${totalItens} itens atualizados com sucesso`);
@@ -501,12 +529,26 @@ app.post('/pedidos', async (req, res) => {
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
       VALUES ($1, $2, $3, $4)
     `;
+    const historicoSql = `
+      INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+    `;
     const totalItens = itens.length;
 
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
       console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
-      await pool.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      const itemResult = await pool.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      const itemId = itemResult.rows[0].id;
+      if (quantidadeEntregue > 0) {
+        const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+        console.log('Tentando inserir no histórico:', { pedido_id: pedidoId, item_id: itemId, quantidadeEntregue, dataEdicao });
+        const historicoResult = await pool.query(historicoSql, [pedidoId, itemId, quantidadeEntregue, dataEdicao]);
+        console.log('Registro inserido no histórico:', historicoResult.rows[0]);
+      } else {
+        console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemId);
+      }
     }
     console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
 
