@@ -249,13 +249,17 @@ app.get('/pedidos', async (req, res) => {
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
+    console.log(`Executando query para histórico do pedido ${pedidoId}`);
     const historico = await db.all(`
       SELECT h.*, i.codigoDesenho 
       FROM historico_entregas h 
       JOIN itens_pedidos i ON h.item_id = i.id 
       WHERE h.pedido_id = $1
     `, [pedidoId]);
-    console.log(`GET /historico-entregas/${pedidoId} - Histórico retornado:`, historico);
+    console.log(`GET /historico-entregas/${pedidoId} - Resultado da query:`, historico);
+    if (!historico || historico.length === 0) {
+      console.log(`Nenhum registro encontrado para pedido ${pedidoId}`);
+    }
     res.json(historico);
   } catch (error) {
     console.error(`Erro ao buscar histórico para pedido ${pedidoId}:`, error.message);
