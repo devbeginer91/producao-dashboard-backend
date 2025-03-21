@@ -193,9 +193,10 @@ const montarEmail = (pedido, itens, observacao) => {
     - Início: ${pedido.inicio}
     ${pedido.dataConclusao ? `- Conclusão: ${pedido.dataConclusao}` : ''}
     - Tempo (min): ${pedido.tempo || 0}
-    ${pedido.peso || pedido.volume ? `- Peso: ${pedido.peso || 'Não informado'}\n- Volume: ${pedido.volume || 'Não informado'}` : ''}
     - Pausado: ${pedido.pausado ? 'Sim' : 'Não'}
     - Tempo Pausado (min): ${pedido.tempoPausado || 0}
+    - Peso: ${pedido.peso !== null ? pedido.peso : 'Não informado'}
+    - Volume: ${pedido.volume !== null ? pedido.volume : 'Não informado'}
     Itens:
     ${itens.map(item => `- Código: ${item.codigoDesenho}, Qtd Pedida: ${item.quantidadePedido}, Qtd Entregue: ${item.quantidadeEntregue}`).join('\n')}
   `;
@@ -278,6 +279,44 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
   }
 });
 
+app.put('/historico-entregas/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { quantidadeEntregue } = req.body;
+
+  if (quantidadeEntregue === undefined || quantidadeEntregue < 0) {
+    return res.status(400).json({ message: 'Quantidade entregue deve ser um número não negativo' });
+  }
+
+  try {
+    const result = await pool.query(
+      'UPDATE historico_entregas SET quantidadeEntregue = $1, dataEdicao = $2 WHERE id = $3 RETURNING *',
+      [quantidadeEntregue, formatDateToLocalISO(new Date(), 'edit_historico_entrega'), id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
+    }
+    res.status(200).json(result.rows[0]);
+  } catch (error) {
+    console.error('Erro ao editar entrada de entrega:', error.message);
+    res.status(500).json({ message: 'Erro ao editar entrada de entrega', error: error.message });
+  }
+});
+
+app.delete('/historico-entregas/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+
+  try {
+    const result = await pool.query('DELETE FROM historico_entregas WHERE id = $1', [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
+    }
+    res.status(204).send();
+  } catch (error) {
+    console.error('Erro ao excluir entrada de entrega:', error.message);
+    res.status(500).json({ message: 'Erro ao excluir entrada de entrega', error: error.message });
+  }
+});
+
 app.get('/historico-observacoes/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
@@ -330,12 +369,11 @@ app.put('/pedidos/:id', async (req, res) => {
 
   const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo);
 
-  const client = await pool.connect(); // Iniciar uma transação
+  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN'); // Iniciar a transação
+    await client.query('BEGIN');
 
-    // Atualizar o pedido
     const pedidoSql = `
       UPDATE pedidos SET
         empresa = $1,
@@ -384,7 +422,6 @@ app.put('/pedidos/:id', async (req, res) => {
     const pedidoAtualizado = result.rows[0];
     console.log(`Pedido ${id} atualizado:`, pedidoAtualizado);
 
-    // Se o status for 'concluido', zerar o saldo dos itens (quantidadeEntregue = quantidadePedido)
     if (status === 'concluido') {
       console.log(`Status do pedido ${id} é 'concluido'. Zerando saldo dos itens...`);
       const updateItensSql = `
@@ -396,7 +433,6 @@ app.put('/pedidos/:id', async (req, res) => {
       const itensResult = await client.query(updateItensSql, [id]);
       console.log(`Itens do pedido ${id} atualizados:`, itensResult.rows);
 
-      // Registrar no histórico de entregas
       const historicoSql = `
         INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
         VALUES ($1, $2, $3, $4)
@@ -404,7 +440,7 @@ app.put('/pedidos/:id', async (req, res) => {
       `;
       const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
       for (const item of itensResult.rows) {
-        const quantidadeEntregue = item.quantidadepedido; // Como zeramos o saldo, a quantidade entregue é igual à pedida
+        const quantidadeEntregue = item.quantidadepedido;
         if (quantidadeEntregue > 0) {
           const historicoResult = await client.query(historicoSql, [id, item.id, quantidadeEntregue, dataEdicao]);
           console.log(`Registro inserido no histórico para item ${item.id}:`, historicoResult.rows[0]);
@@ -412,7 +448,6 @@ app.put('/pedidos/:id', async (req, res) => {
       }
     }
 
-    // Atualizar os itens do pedido, se fornecidos
     if (itens && Array.isArray(itens)) {
       const totalItens = itens.length;
       console.log(`Atualizando ${totalItens} itens para o pedido ${id}`);
@@ -428,7 +463,7 @@ app.put('/pedidos/:id', async (req, res) => {
         RETURNING *
       `;
       for (const item of itens) {
-        if (!item.id) continue; // Pular itens sem ID (novos itens não devem ser atualizados aqui)
+        if (!item.id) continue;
         const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
         const itemResult = await client.query(itemSql, [
           codigoDesenho,
@@ -455,9 +490,8 @@ app.put('/pedidos/:id', async (req, res) => {
       }
     }
 
-    await client.query('COMMIT'); // Confirmar transação
+    await client.query('COMMIT');
 
-    // Buscar os itens atualizados do pedido para retornar
     const itensSql = 'SELECT * FROM itens_pedidos WHERE pedido_id = $1';
     const itensResult = await client.query(itensSql, [id]);
     const pedidoComItens = { 
@@ -478,10 +512,27 @@ app.put('/pedidos/:id', async (req, res) => {
         quantidadeEntregue: item.quantidadeentregue
       }))
     };
+
+    // Enviar e-mail com as informações atualizadas
+    try {
+      const mailResponse = await fetch('https://producao-dashboard-backend.onrender.com/enviar-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pedido: pedidoComItens, observacao: '' })
+      });
+      if (!mailResponse.ok) {
+        console.error('Erro ao enviar e-mail após atualização do pedido:', mailResponse.statusText);
+      } else {
+        console.log('E-mail enviado com sucesso após atualização do pedido');
+      }
+    } catch (emailError) {
+      console.error('Erro ao enviar e-mail:', emailError.message);
+    }
+
     console.log('Pedido atualizado retornado:', pedidoComItens);
     res.status(200).json(pedidoComItens);
   } catch (error) {
-    await client.query('ROLLBACK'); // Reverter transação em caso de erro
+    await client.query('ROLLBACK');
     console.error('Erro ao atualizar pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao atualizar pedido', error: error.message, stack: error.stack });
   } finally {
