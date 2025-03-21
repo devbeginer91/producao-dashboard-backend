@@ -181,7 +181,7 @@ const converterFormatoData = (dataInput) => {
   return new Date().toISOString().slice(0, 19).replace('T', ' ');
 };
 
-const montarEmail = (pedido, itens, observacao) => {
+const montarEmail = (pedido, itens, observacao, quantidadesEditadas) => {
   const detalhesPedido = `
     Detalhes do Pedido:
     - Empresa: ${pedido.empresa || 'Não informado'}
@@ -195,13 +195,17 @@ const montarEmail = (pedido, itens, observacao) => {
     - Tempo (min): ${pedido.tempo || 0}
     - Pausado: ${pedido.pausado ? 'Sim' : 'Não'}
     - Tempo Pausado (min): ${pedido.tempoPausado || 0}
-    - Peso: ${pedido.peso !== null ? pedido.peso : 'Não informado'}
-    - Volume: ${pedido.volume !== null ? pedido.volume : 'Não informado'}
     Itens:
-    ${itens.map(item => `- Código: ${item.codigoDesenho}, Qtd Pedida: ${item.quantidadePedido}, Qtd Entregue: ${item.quantidadeEntregue}`).join('\n')}
+    ${itens.map(item => `- Código: ${item.codigoDesenho}, Qtd Pedida: ${item.quantidadePedido}, Qtd Entregue: ${item.quantidadeEntregue}, Saldo: ${item.quantidadePedido - item.quantidadeEntregue}`).join('\n')}
   `;
+
+  const quantidadesEditadasText = quantidadesEditadas && quantidadesEditadas.length > 0 ? `
+    Quantidade Editada:
+    ${quantidadesEditadas.map(edit => `- Código: ${edit.codigoDesenho}, QTD: ${edit.quantidade}, Peso: ${pedido.peso || 'Não informado'}, Volume: ${pedido.volume || 'Não informado'}`).join('\n')}
+  ` : '';
+
   const observacaoText = observacao ? `${observacao}\n\n` : '';
-  return `${observacaoText}${detalhesPedido}`.trim();
+  return `${observacaoText}${detalhesPedido}${quantidadesEditadasText}`.trim();
 };
 
 const transporter = nodemailer.createTransport({
@@ -371,15 +375,18 @@ app.put('/historico-observacoes/:id', async (req, res) => {
     res.status(500).json({ message: 'Erro ao editar observação', error: error.message });
   }
 });
+
 app.delete('/historico-observacoes/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
   try {
+    console.log(`Tentando excluir observação com id ${id}`);
     const result = await pool.query('DELETE FROM historico_observacoes WHERE id = $1 RETURNING *', [id]);
     if (result.rows.length === 0) {
+      console.error(`Observação ${id} não encontrada`);
       return res.status(404).json({ message: 'Observação não encontrada' });
     }
-    console.log(`Observação ${id} excluída com sucesso`);
+    console.log(`Observação ${id} excluída com sucesso:`, result.rows[0]);
     res.status(200).json({ message: 'Observação excluída com sucesso' });
   } catch (error) {
     console.error('Erro ao excluir observação:', error.message);
@@ -563,23 +570,7 @@ app.put('/pedidos/:id', async (req, res) => {
       }))
     };
 
-    // Enviar e-mail com as informações atualizadas
-    try {
-      const mailResponse = await fetch('https://producao-dashboard-backend.onrender.com/enviar-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pedido: pedidoComItens, observacao: '' })
-      });
-      if (!mailResponse.ok) {
-        console.error('Erro ao enviar e-mail após atualização do pedido:', mailResponse.statusText);
-      } else {
-        console.log('E-mail enviado com sucesso após atualização do pedido');
-      }
-    } catch (emailError) {
-      console.error('Erro ao enviar e-mail:', emailError.message);
-    }
-
-    console.log('Pedido atualizado retornado:', pedidoComItens);
+    console.log('Itens retornados após atualização do pedido:', pedidoComItens.itens);
     res.status(200).json(pedidoComItens);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -640,10 +631,10 @@ app.post('/pedidos', async (req, res) => {
   `;
   const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado];
 
-  const client = await pool.connect(); // Iniciar uma transação
+  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN'); // Iniciar a transação
+    await client.query('BEGIN');
 
     console.log('Inserindo pedido principal com valores:', pedidoValues);
     const result = await client.query(pedidoSql, pedidoValues);
@@ -685,7 +676,7 @@ app.post('/pedidos', async (req, res) => {
     }
     console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
 
-    await client.query('COMMIT'); // Confirmar a transação
+    await client.query('COMMIT');
 
     const novoPedido = { 
       id: pedidoId, 
@@ -704,19 +695,18 @@ app.post('/pedidos', async (req, res) => {
     console.log('Novo pedido retornado:', novoPedido);
     res.status(201).json(novoPedido);
   } catch (error) {
-    await client.query('ROLLBACK'); // Reverter a transação em caso de erro
+    await client.query('ROLLBACK');
     console.error('Erro ao processar pedido:', error.message, 'Stack:', error.stack);
     res.status(500).json({ message: 'Erro ao processar pedido', error: error.message, stack: error.stack });
   } finally {
-    client.release(); // Liberar o cliente da pool
+    client.release();
   }
 });
 
-// Endpoint para salvar uma nova observação (no POST /enviar-email)
 app.post('/enviar-email', async (req, res) => {
-  const { pedido, observacao } = req.body;
+  const { pedido, observacao, quantidadesEditadas } = req.body;
 
-  console.log('Dados recebidos no POST /enviar-email:', { pedido, observacao });
+  console.log('Dados recebidos no POST /enviar-email:', { pedido, observacao, quantidadesEditadas });
 
   if (!pedido || !pedido.numeroOS) {
     console.error('Erro: Nenhum pedido ou numeroOS fornecido para envio de e-mail');
@@ -737,7 +727,7 @@ app.post('/enviar-email', async (req, res) => {
     from: process.env.EMAIL_USER || 'dcashopecia@gmail.com',
     to: process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br',
     subject,
-    text: montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao),
+    text: montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas),
   };
 
   try {
