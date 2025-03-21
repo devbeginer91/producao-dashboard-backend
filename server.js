@@ -322,16 +322,53 @@ app.get('/historico-observacoes/:pedidoId', async (req, res) => {
   try {
     console.log(`Executando query para histórico de observações do pedido ${pedidoId}`);
     const historico = await db.all(`
-      SELECT * FROM historico_observacoes 
+      SELECT id, pedido_id, observacao, dataEdicao 
+      FROM historico_observacoes 
       WHERE pedido_id = $1
       ORDER BY dataEdicao ASC
     `, [pedidoId]);
     console.log(`GET /historico-observacoes/${pedidoId} - Resultado da query:`, historico);
-    // Sempre retornar um array, mesmo que vazio, para evitar erro no frontend
-    res.json(historico || []);
+    // Mapear os campos para garantir consistência
+    const historicoFormatado = historico.map(entry => ({
+      id: entry.id,
+      pedido_id: entry.pedido_id,
+      observacao: entry.observacao,
+      dataEdicao: entry.dataedicao ? converterFormatoData(entry.dataedicao) : null
+    }));
+    res.json(historicoFormatado || []);
   } catch (error) {
     console.error(`Erro ao buscar histórico de observações para pedido ${pedidoId}:`, error.message);
     res.status(500).json({ message: 'Erro ao buscar histórico de observações', error: error.message });
+  }
+});
+
+app.put('/historico-observacoes/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { observacao } = req.body;
+
+  if (!observacao || observacao.trim() === '') {
+    return res.status(400).json({ message: 'Observação não pode ser vazia' });
+  }
+
+  try {
+    const dataEdicao = formatDateToLocalISO(new Date(), 'edit_observacao');
+    const result = await pool.query(
+      'UPDATE historico_observacoes SET observacao = $1, dataEdicao = $2 WHERE id = $3 RETURNING *',
+      [observacao.trim(), dataEdicao, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Observação não encontrada' });
+    }
+    const updatedEntry = result.rows[0];
+    res.status(200).json({
+      id: updatedEntry.id,
+      pedido_id: updatedEntry.pedido_id,
+      observacao: updatedEntry.observacao,
+      dataEdicao: updatedEntry.dataedicao ? converterFormatoData(updatedEntry.dataedicao) : null
+    });
+  } catch (error) {
+    console.error('Erro ao editar observação:', error.message);
+    res.status(500).json({ message: 'Erro ao editar observação', error: error.message });
   }
 });
 
@@ -660,6 +697,7 @@ app.post('/pedidos', async (req, res) => {
   }
 });
 
+// Endpoint para salvar uma nova observação (no POST /enviar-email)
 app.post('/enviar-email', async (req, res) => {
   const { pedido, observacao } = req.body;
 
@@ -696,9 +734,10 @@ app.post('/enviar-email', async (req, res) => {
       const observacaoSql = `
         INSERT INTO historico_observacoes (pedido_id, observacao, dataEdicao)
         VALUES ($1, $2, $3)
+        RETURNING *
       `;
-      await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
-      console.log(`Observação salva no histórico para pedido ${pedido.id}:`, { observacao, dataEdicao });
+      const result = await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
+      console.log(`Observação salva no histórico para pedido ${pedido.id}:`, result.rows[0]);
     }
 
     res.status(200).json({ message: 'E-mail enviado com sucesso' });
