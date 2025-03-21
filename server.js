@@ -371,6 +371,21 @@ app.put('/historico-observacoes/:id', async (req, res) => {
     res.status(500).json({ message: 'Erro ao editar observação', error: error.message });
   }
 });
+app.delete('/historico-observacoes/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+
+  try {
+    const result = await pool.query('DELETE FROM historico_observacoes WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Observação não encontrada' });
+    }
+    console.log(`Observação ${id} excluída com sucesso`);
+    res.status(200).json({ message: 'Observação excluída com sucesso' });
+  } catch (error) {
+    console.error('Erro ao excluir observação:', error.message);
+    res.status(500).json({ message: 'Erro ao excluir observação', error: error.message });
+  }
+});
 
 app.put('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
