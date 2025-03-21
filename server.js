@@ -327,10 +327,8 @@ app.get('/historico-observacoes/:pedidoId', async (req, res) => {
       ORDER BY dataEdicao ASC
     `, [pedidoId]);
     console.log(`GET /historico-observacoes/${pedidoId} - Resultado da query:`, historico);
-    if (!historico || historico.length === 0) {
-      console.log(`Nenhum registro de observações encontrado para pedido ${pedidoId}`);
-    }
-    res.json(historico);
+    // Sempre retornar um array, mesmo que vazio, para evitar erro no frontend
+    res.json(historico || []);
   } catch (error) {
     console.error(`Erro ao buscar histórico de observações para pedido ${pedidoId}:`, error.message);
     res.status(500).json({ message: 'Erro ao buscar histórico de observações', error: error.message });
