@@ -513,31 +513,44 @@ app.put('/pedidos/:id', async (req, res) => {
         WHERE pedido_id = $4 AND id = $5
         RETURNING *
       `;
+      const insertItemSql = `
+        INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+      `;
       const historicoSql = `
         INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
         VALUES ($1, $2, $3, $4)
         RETURNING *
       `;
       for (const item of itens) {
-        if (!item.id) {
-          console.warn(`Item sem ID encontrado, pulando:`, item);
-          continue;
+        const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        console.log(`Processando item:`, { itemId, codigoDesenho, quantidadePedido, quantidadeEntregue });
+        let updatedItem;
+        if (itemId) {
+          const itemResult = await client.query(itemSql, [
+            codigoDesenho,
+            quantidadePedido,
+            quantidadeEntregue || 0,
+            id,
+            itemId
+          ]);
+          if (itemResult.rows.length === 0) {
+            console.warn(`Item ${itemId} não encontrado para o pedido ${id}, pulando...`);
+            continue;
+          }
+          updatedItem = itemResult.rows[0];
+          console.log(`Item ${itemId} atualizado:`, updatedItem);
+        } else {
+          const itemResult = await client.query(insertItemSql, [
+            id,
+            codigoDesenho,
+            quantidadePedido,
+            quantidadeEntregue || 0
+          ]);
+          updatedItem = itemResult.rows[0];
+          console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
         }
-        const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-        console.log(`Atualizando item ${item.id}:`, { codigoDesenho, quantidadePedido, quantidadeEntregue });
-        const itemResult = await client.query(itemSql, [
-          codigoDesenho,
-          quantidadePedido,
-          quantidadeEntregue || 0,
-          id,
-          item.id
-        ]);
-        if (itemResult.rows.length === 0) {
-          console.warn(`Item ${item.id} não encontrado para o pedido ${id}, pulando...`);
-          continue;
-        }
-        const updatedItem = itemResult.rows[0];
-        console.log(`Item ${item.id} atualizado:`, updatedItem);
         if (quantidadeEntregue > 0) {
           const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
           const historicoResult = await client.query(historicoSql, [
