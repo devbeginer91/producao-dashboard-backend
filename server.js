@@ -854,7 +854,7 @@ app.post('/enviar-email', async (req, res) => {
   const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
 
   // Dividir os destinatários em uma lista e remover elementos vazios
-  const rawEmailTo = process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br';
+  const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, ''); // Remove todos os espaços e quebras de linha
   console.log('EMAIL_TO bruto:', rawEmailTo);
 
   const destinatarios = rawEmailTo
