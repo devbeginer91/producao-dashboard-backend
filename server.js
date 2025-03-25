@@ -254,7 +254,7 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
     const historico = await db.all(`
       SELECT h.*, i.codigoDesenho 
       FROM historico_entregas h 
-      JOIN itens_pedidos i ON h.item_id = i.id 
+      LEFT JOIN itens_pedidos i ON h.item_id = i.id 
       WHERE h.pedido_id = $1
       ORDER BY h.dataEdicao ASC
     `, [pedidoId]);
@@ -339,6 +339,8 @@ app.delete('/historico-entregas/:id', async (req, res) => {
     }
     const historicoEntry = historicoResult.rows[0];
     const itemId = historicoEntry.item_id;
+
+    console.log(`DELETE /historico-entregas/${id} - Excluindo entrada do histórico:`, historicoEntry);
 
     const deleteResult = await client.query('DELETE FROM historico_entregas WHERE id = $1 RETURNING *', [id]);
     if (deleteResult.rowCount === 0) {
@@ -610,6 +612,7 @@ app.put('/pedidos/:id', async (req, res) => {
       const codigosEnviados = new Set(itens.map(item => item.codigoDesenho));
       for (const itemExistente of itensExistentes.rows) {
         if (!codigosEnviados.has(itemExistente.codigodesenho)) {
+          console.log(`PUT /pedidos/${id} - Excluindo item ${itemExistente.id} (código: ${itemExistente.codigodesenho}) do pedido ${id}, pois não está mais na lista.`);
           await client.query('DELETE FROM itens_pedidos WHERE id = $1', [itemExistente.id]);
         }
       }
