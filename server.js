@@ -854,10 +854,13 @@ app.post('/enviar-email', async (req, res) => {
   const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
 
   // Dividir os destinatários em uma lista e remover elementos vazios
-  const destinatarios = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br')
+  const rawEmailTo = process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br';
+  console.log('EMAIL_TO bruto:', rawEmailTo);
+
+  const destinatarios = rawEmailTo
     .split(',')
     .map(email => email.trim())
-    .filter(email => email.length > 0);
+    .filter(email => email.length > 0 && email.includes('@')); // Garante que o e-mail seja válido
 
   console.log('Lista de destinatários após split, trim e filtro:', destinatarios);
 
