@@ -534,57 +534,67 @@ app.put('/pedidos/:id', async (req, res) => {
         console.log(`Processando item:`, { itemId, codigoDesenho, quantidadePedido, quantidadeEntregue });
 
         let updatedItem;
-        if (itemId) {
-          // Se o item tem um ID, atualize-o
+        // Verificar se já existe um item com o mesmo código no banco
+        const itemExistente = itensExistentesMap.get(codigoDesenho);
+        if (itemExistente) {
+          // Calcular a diferença na quantidade entregue
+          const quantidadeEntregueAnterior = itemExistente.quantidadeentregue || 0;
+          const novaQuantidadeEntregue = parseInt(quantidadeEntregue || 0, 10);
+          const quantidadeAdicionada = novaQuantidadeEntregue - quantidadeEntregueAnterior;
+
+          // Atualizar o item existente
           const itemResult = await client.query(itemSql, [
             codigoDesenho,
             quantidadePedido,
-            quantidadeEntregue || 0,
+            novaQuantidadeEntregue,
             id,
-            itemId
+            itemExistente.id
           ]);
-          if (itemResult.rows.length === 0) {
-            console.warn(`Item ${itemId} não encontrado para o pedido ${id}, pulando...`);
-            continue;
-          }
           updatedItem = itemResult.rows[0];
-          console.log(`Item ${itemId} atualizado:`, updatedItem);
+          console.log(`Item existente ${itemExistente.id} atualizado:`, updatedItem);
+
+          // Registrar a diferença no histórico, se houver
+          if (quantidadeAdicionada > 0) {
+            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+            const historicoResult = await client.query(historicoSql, [
+              id,
+              updatedItem.id,
+              quantidadeAdicionada, // Registrar apenas a quantidade adicionada
+              dataEdicao
+            ]);
+            console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
+          }
         } else {
-          // Se o item não tem ID, verifique se já existe um item com o mesmo código
-          const itemExistente = itensExistentesMap.get(codigoDesenho);
-          if (itemExistente) {
-            // Se já existe um item com o mesmo código, atualize-o
-            const itemResult = await client.query(itemSql, [
-              codigoDesenho,
-              quantidadePedido,
-              quantidadeEntregue || 0,
+          // Se não existe, inserir um novo item
+          const itemResult = await client.query(insertItemSql, [
+            id,
+            codigoDesenho,
+            quantidadePedido,
+            quantidadeEntregue || 0
+          ]);
+          updatedItem = itemResult.rows[0];
+          console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
+
+          // Registrar no histórico, se houver quantidade entregue
+          if (quantidadeEntregue > 0) {
+            const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
+            const historicoResult = await client.query(historicoSql, [
               id,
-              itemExistente.id
+              updatedItem.id,
+              quantidadeEntregue,
+              dataEdicao
             ]);
-            updatedItem = itemResult.rows[0];
-            console.log(`Item existente ${itemExistente.id} atualizado:`, updatedItem);
-          } else {
-            // Se não existe, insira um novo item
-            const itemResult = await client.query(insertItemSql, [
-              id,
-              codigoDesenho,
-              quantidadePedido,
-              quantidadeEntregue || 0
-            ]);
-            updatedItem = itemResult.rows[0];
-            console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
+            console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
           }
         }
+      }
 
-        if (quantidadeEntregue > 0) {
-          const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-          const historicoResult = await client.query(historicoSql, [
-            id,
-            updatedItem.id,
-            quantidadeEntregue,
-            dataEdicao
-          ]);
-          console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
+      // Opcional: Remover itens que não estão mais na lista enviada
+      const codigosEnviados = new Set(itens.map(item => item.codigoDesenho));
+      for (const itemExistente of itensExistentes.rows) {
+        if (!codigosEnviados.has(itemExistente.codigodesenho)) {
+          await client.query('DELETE FROM itens_pedidos WHERE id = $1', [itemExistente.id]);
+          console.log(`Item ${itemExistente.id} removido do pedido ${id}, pois não está mais na lista.`);
         }
       }
     }
