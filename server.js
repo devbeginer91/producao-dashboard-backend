@@ -294,11 +294,15 @@ app.put('/historico-entregas/:id', async (req, res) => {
     return res.status(400).json({ message: 'Quantidade entregue deve ser um número não negativo' });
   }
 
+  const client = await pool.connect();
+
   try {
+    await client.query('BEGIN');
+
     // Buscar o registro do histórico para obter o item_id e pedido_id
-    const historicoResult = await pool.query('SELECT * FROM historico_entregas WHERE id = $1', [id]);
+    const historicoResult = await client.query('SELECT * FROM historico_entregas WHERE id = $1', [id]);
     if (historicoResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
+      throw new Error('Entrada de entrega não encontrada');
     }
     const historicoEntry = historicoResult.rows[0];
     const itemId = historicoEntry.item_id;
@@ -306,31 +310,30 @@ app.put('/historico-entregas/:id', async (req, res) => {
 
     // Atualizar o registro no histórico
     const dataEdicao = formatDateToLocalISO(new Date(), 'edit_historico_entrega');
-    const updateResult = await pool.query(
+    const updateResult = await client.query(
       'UPDATE historico_entregas SET quantidadeEntregue = $1, dataEdicao = $2 WHERE id = $3 RETURNING *',
       [quantidadeEntregue, dataEdicao, id]
     );
-    if (updateResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
-    }
     const updatedEntry = updateResult.rows[0];
 
     // Recalcular a quantidadeEntregue total do item no itens_pedidos
-    const historicoTotalResult = await pool.query(
+    const historicoTotalResult = await client.query(
       'SELECT SUM(quantidadeEntregue) as total FROM historico_entregas WHERE item_id = $1',
       [itemId]
     );
     const totalEntregue = parseInt(historicoTotalResult.rows[0].total, 10) || 0;
 
     // Atualizar a quantidadeEntregue no itens_pedidos
-    await pool.query(
+    await client.query(
       'UPDATE itens_pedidos SET quantidadeEntregue = $1 WHERE id = $2',
       [totalEntregue, itemId]
     );
 
     // Buscar o codigoDesenho do item para incluir na resposta
-    const itemResult = await pool.query('SELECT codigoDesenho FROM itens_pedidos WHERE id = $1', [itemId]);
+    const itemResult = await client.query('SELECT codigoDesenho FROM itens_pedidos WHERE id = $1', [itemId]);
     const codigoDesenho = itemResult.rows[0]?.codigodesenho || 'Desconhecido';
+
+    await client.query('COMMIT');
 
     // Retornar o registro atualizado com o codigoDesenho
     res.status(200).json({
@@ -338,23 +341,59 @@ app.put('/historico-entregas/:id', async (req, res) => {
       codigoDesenho
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Erro ao editar entrada de entrega:', error.message);
     res.status(500).json({ message: 'Erro ao editar entrada de entrega', error: error.message });
+  } finally {
+    client.release();
   }
 });
 
+// Endpoint para excluir uma entrada no histórico de entregas
 app.delete('/historico-entregas/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
+  const client = await pool.connect();
+
   try {
-    const result = await pool.query('DELETE FROM historico_entregas WHERE id = $1', [id]);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
+    await client.query('BEGIN');
+
+    // Buscar o registro do histórico para obter o item_id
+    const historicoResult = await client.query('SELECT * FROM historico_entregas WHERE id = $1', [id]);
+    if (historicoResult.rows.length === 0) {
+      throw new Error('Entrada de entrega não encontrada');
     }
+    const historicoEntry = historicoResult.rows[0];
+    const itemId = historicoEntry.item_id;
+
+    // Excluir o registro do histórico
+    const deleteResult = await client.query('DELETE FROM historico_entregas WHERE id = $1 RETURNING *', [id]);
+    if (deleteResult.rowCount === 0) {
+      throw new Error('Entrada de entrega não encontrada');
+    }
+
+    // Recalcular a quantidadeEntregue total do item no itens_pedidos
+    const historicoTotalResult = await client.query(
+      'SELECT SUM(quantidadeEntregue) as total FROM historico_entregas WHERE item_id = $1',
+      [itemId]
+    );
+    const totalEntregue = parseInt(historicoTotalResult.rows[0].total, 10) || 0;
+
+    // Atualizar a quantidadeEntregue no itens_pedidos
+    await client.query(
+      'UPDATE itens_pedidos SET quantidadeEntregue = $1 WHERE id = $2',
+      [totalEntregue, itemId]
+    );
+
+    await client.query('COMMIT');
+
     res.status(204).send();
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Erro ao excluir entrada de entrega:', error.message);
     res.status(500).json({ message: 'Erro ao excluir entrada de entrega', error: error.message });
+  } finally {
+    client.release();
   }
 });
 
