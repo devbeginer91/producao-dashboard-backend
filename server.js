@@ -262,6 +262,7 @@ app.get('/pedidos', async (req, res) => {
   }
 });
 
+// Endpoint para buscar o histórico de entregas
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
@@ -271,6 +272,7 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
       FROM historico_entregas h 
       JOIN itens_pedidos i ON h.item_id = i.id 
       WHERE h.pedido_id = $1
+      ORDER BY h.dataEdicao ASC
     `, [pedidoId]);
     console.log(`GET /historico-entregas/${pedidoId} - Resultado da query:`, historico);
     if (!historico || historico.length === 0) {
@@ -283,6 +285,7 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
   }
 });
 
+// Endpoint para editar uma entrada no histórico de entregas
 app.put('/historico-entregas/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const { quantidadeEntregue } = req.body;
@@ -292,14 +295,48 @@ app.put('/historico-entregas/:id', async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      'UPDATE historico_entregas SET quantidadeEntregue = $1, dataEdicao = $2 WHERE id = $3 RETURNING *',
-      [quantidadeEntregue, formatDateToLocalISO(new Date(), 'edit_historico_entrega'), id]
-    );
-    if (result.rows.length === 0) {
+    // Buscar o registro do histórico para obter o item_id e pedido_id
+    const historicoResult = await pool.query('SELECT * FROM historico_entregas WHERE id = $1', [id]);
+    if (historicoResult.rows.length === 0) {
       return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
     }
-    res.status(200).json(result.rows[0]);
+    const historicoEntry = historicoResult.rows[0];
+    const itemId = historicoEntry.item_id;
+    const pedidoId = historicoEntry.pedido_id;
+
+    // Atualizar o registro no histórico
+    const dataEdicao = formatDateToLocalISO(new Date(), 'edit_historico_entrega');
+    const updateResult = await pool.query(
+      'UPDATE historico_entregas SET quantidadeEntregue = $1, dataEdicao = $2 WHERE id = $3 RETURNING *',
+      [quantidadeEntregue, dataEdicao, id]
+    );
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Entrada de entrega não encontrada' });
+    }
+    const updatedEntry = updateResult.rows[0];
+
+    // Recalcular a quantidadeEntregue total do item no itens_pedidos
+    const historicoTotalResult = await pool.query(
+      'SELECT SUM(quantidadeEntregue) as total FROM historico_entregas WHERE item_id = $1',
+      [itemId]
+    );
+    const totalEntregue = parseInt(historicoTotalResult.rows[0].total, 10) || 0;
+
+    // Atualizar a quantidadeEntregue no itens_pedidos
+    await pool.query(
+      'UPDATE itens_pedidos SET quantidadeEntregue = $1 WHERE id = $2',
+      [totalEntregue, itemId]
+    );
+
+    // Buscar o codigoDesenho do item para incluir na resposta
+    const itemResult = await pool.query('SELECT codigoDesenho FROM itens_pedidos WHERE id = $1', [itemId]);
+    const codigoDesenho = itemResult.rows[0]?.codigodesenho || 'Desconhecido';
+
+    // Retornar o registro atualizado com o codigoDesenho
+    res.status(200).json({
+      ...updatedEntry,
+      codigoDesenho
+    });
   } catch (error) {
     console.error('Erro ao editar entrada de entrega:', error.message);
     res.status(500).json({ message: 'Erro ao editar entrada de entrega', error: error.message });
