@@ -9,19 +9,15 @@ const PORT = process.env.PORT || 5000;
 const formatDateToLocalISO = (date, context = 'unknown') => {
   const d = date ? new Date(date) : new Date();
   if (isNaN(d.getTime()) || (typeof date === 'string' && date.includes('undefined'))) {
-    console.warn(`[formatDateToLocalISO - ${context}] Data inválida detectada, usando data atual:`, date);
     return new Date().toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).slice(0, 19);
   }
-  const isoString = d.toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).slice(0, 19);
-  console.log(`[formatDateToLocalISO - ${context}] Data capturada: ${d.toString()}, Data formatada: ${isoString}`);
-  return isoString;
+  return d.toLocaleString('sv-SE', { timeZone: 'America/Sao_Paulo' }).slice(0, 19);
 };
 
 const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
   const inicioDate = new Date(inicio);
   const fimDate = new Date(fim);
   if (isNaN(inicioDate) || isNaN(fimDate)) {
-    console.warn('Data inválida em calcularTempo:', { inicio, fim });
     return 0;
   }
   const diffMs = fimDate - inicioDate;
@@ -48,7 +44,6 @@ app.get('/', (req, res) => {
 });
 
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Body:`, req.body);
   next();
 });
 
@@ -62,7 +57,6 @@ pool.connect((err) => {
     console.error('Erro ao conectar ao PostgreSQL:', err.message);
     process.exit(1);
   } else {
-    console.log('Conectado ao banco PostgreSQL');
     initializeDatabase();
   }
 });
@@ -116,7 +110,6 @@ const initializeDatabase = async () => {
         dataInicioPausa TEXT
       )
     `);
-    console.log('Tabela pedidos verificada/criada');
 
     await db.run(`
       CREATE TABLE IF NOT EXISTS itens_pedidos (
@@ -128,7 +121,6 @@ const initializeDatabase = async () => {
         FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
       )
     `);
-    console.log('Tabela itens_pedidos verificada/criada');
 
     await db.run(`
       CREATE TABLE IF NOT EXISTS historico_entregas (
@@ -141,7 +133,6 @@ const initializeDatabase = async () => {
         FOREIGN KEY (item_id) REFERENCES itens_pedidos(id) ON DELETE CASCADE
       )
     `);
-    console.log('Tabela historico_entregas verificada/criada');
 
     await db.run(`
       CREATE TABLE IF NOT EXISTS historico_observacoes (
@@ -152,7 +143,6 @@ const initializeDatabase = async () => {
         FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
       )
     `);
-    console.log('Tabela historico_observacoes verificada/criada');
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -160,7 +150,6 @@ const initializeDatabase = async () => {
 
 const converterFormatoData = (dataInput) => {
   if (!dataInput || typeof dataInput !== 'string' || dataInput.includes('undefined')) {
-    console.warn('Data inválida fornecida, usando data atual:', dataInput);
     return new Date().toISOString().slice(0, 19).replace('T', ' ');
   }
 
@@ -177,7 +166,6 @@ const converterFormatoData = (dataInput) => {
     return parsedDate.toISOString().slice(0, 19).replace('T', ' ');
   }
 
-  console.warn('Formato de data não reconhecido, usando data atual:', dataInput);
   return new Date().toISOString().slice(0, 19).replace('T', ' ');
 };
 
@@ -227,10 +215,9 @@ app.get('/pedidos', async (req, res) => {
         tempoFinal = Number(pedido.tempo) || 0;
       } else if (pedido.status === 'andamento' && pedido.pausado !== '1') {
         const dataReferencia = pedido.datapausada || pedido.inicio;
-        const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date(), `fetchPedidos - pedido ${pedido.id}`));
+        const tempoDecorrido = calcularTempo(dataReferencia, formatDateToLocalISO(new Date()));
         tempoFinal = tempoPausado + tempoDecorrido;
       }
-      console.log(`GET /pedidos - pedido ${pedido.id}: tempoFinal = ${tempoFinal}, tempoPausado = ${tempoPausado}, pausado = ${pedido.pausado}, inicio = ${pedido.inicio}, dataPausada = ${pedido.datapausada}`);
       return {
         ...pedido,
         numeroOS: pedido.numeroos,
@@ -254,7 +241,6 @@ app.get('/pedidos', async (req, res) => {
         }))
       };
     });
-    console.log('Pedidos retornados:', pedidosComItens);
     res.json(pedidosComItens);
   } catch (err) {
     console.error('Erro ao listar pedidos:', err.message);
@@ -265,7 +251,6 @@ app.get('/pedidos', async (req, res) => {
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
-    console.log(`Executando query para histórico do pedido ${pedidoId}`);
     const historico = await db.all(`
       SELECT h.*, i.codigoDesenho 
       FROM historico_entregas h 
@@ -273,10 +258,7 @@ app.get('/historico-entregas/:pedidoId', async (req, res) => {
       WHERE h.pedido_id = $1
       ORDER BY h.dataEdicao ASC
     `, [pedidoId]);
-    console.log(`GET /historico-entregas/${pedidoId} - Resultado da query:`, historico);
-    if (!historico || historico.length === 0) {
-      console.log(`Nenhum registro encontrado para pedido ${pedidoId}`);
-    }
+    console.log(`GET /historico-entregas/${pedidoId} - Dados retornados:`, historico);
     res.json(historico);
   } catch (error) {
     console.error(`Erro ao buscar histórico para pedido ${pedidoId}:`, error.message);
@@ -332,7 +314,7 @@ app.put('/historico-entregas/:id', async (req, res) => {
       ...updatedEntry,
       codigoDesenho
     };
-    console.log(`PUT /historico-entregas/${id} - Dados retornados:`, responseData);
+    console.log(`PUT /historico-entregas/${id} - Dados retornados ao frontend:`, responseData);
     res.status(200).json(responseData);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -343,7 +325,6 @@ app.put('/historico-entregas/:id', async (req, res) => {
   }
 });
 
-// Endpoint para excluir uma entrada no histórico de entregas
 app.delete('/historico-entregas/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
@@ -352,7 +333,6 @@ app.delete('/historico-entregas/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Buscar o registro do histórico para obter o item_id
     const historicoResult = await client.query('SELECT * FROM historico_entregas WHERE id = $1', [id]);
     if (historicoResult.rows.length === 0) {
       throw new Error('Entrada de entrega não encontrada');
@@ -360,20 +340,17 @@ app.delete('/historico-entregas/:id', async (req, res) => {
     const historicoEntry = historicoResult.rows[0];
     const itemId = historicoEntry.item_id;
 
-    // Excluir o registro do histórico
     const deleteResult = await client.query('DELETE FROM historico_entregas WHERE id = $1 RETURNING *', [id]);
     if (deleteResult.rowCount === 0) {
       throw new Error('Entrada de entrega não encontrada');
     }
 
-    // Recalcular a quantidadeEntregue total do item no itens_pedidos
     const historicoTotalResult = await client.query(
       'SELECT SUM(quantidadeEntregue) as total FROM historico_entregas WHERE item_id = $1',
       [itemId]
     );
     const totalEntregue = parseInt(historicoTotalResult.rows[0].total, 10) || 0;
 
-    // Atualizar a quantidadeEntregue no itens_pedidos
     await client.query(
       'UPDATE itens_pedidos SET quantidadeEntregue = $1 WHERE id = $2',
       [totalEntregue, itemId]
@@ -394,14 +371,12 @@ app.delete('/historico-entregas/:id', async (req, res) => {
 app.get('/historico-observacoes/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
-    console.log(`Executando query para histórico de observações do pedido ${pedidoId}`);
     const historico = await db.all(`
       SELECT id, pedido_id, observacao, dataEdicao 
       FROM historico_observacoes 
       WHERE pedido_id = $1
       ORDER BY dataEdicao ASC
     `, [pedidoId]);
-    console.log(`GET /historico-observacoes/${pedidoId} - Resultado da query:`, historico);
     const historicoFormatado = historico.map(entry => ({
       id: entry.id,
       pedido_id: entry.pedido_id,
@@ -449,13 +424,10 @@ app.delete('/historico-observacoes/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
   try {
-    console.log(`Tentando excluir observação com id ${id}`);
     const result = await pool.query('DELETE FROM historico_observacoes WHERE id = $1 RETURNING *', [id]);
     if (result.rows.length === 0) {
-      console.error(`Observação ${id} não encontrada`);
       return res.status(404).json({ message: 'Observação não encontrada' });
     }
-    console.log(`Observação ${id} excluída com sucesso:`, result.rows[0]);
     res.status(200).json({ message: 'Observação excluída com sucesso' });
   } catch (error) {
     console.error('Erro ao excluir observação:', error.message);
@@ -483,8 +455,6 @@ app.put('/pedidos/:id', async (req, res) => {
     dataInicioPausa, 
     itens 
   } = req.body;
-
-  console.log('Dados recebidos no PUT /pedidos:', { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, itens });
 
   const inicioFormatado = converterFormatoData(inicio);
   const dataConclusaoFormatada = status === 'concluido' && !dataConclusao
@@ -539,17 +509,13 @@ app.put('/pedidos/:id', async (req, res) => {
       id
     ];
 
-    console.log('Atualizando pedido com valores:', pedidoValues);
     const result = await client.query(pedidoSql, pedidoValues);
     if (result.rows.length === 0) {
-      console.error('Pedido não encontrado:', id);
       throw new Error('Pedido não encontrado');
     }
     const pedidoAtualizado = result.rows[0];
-    console.log(`Pedido ${id} atualizado:`, pedidoAtualizado);
 
     if (status === 'concluido') {
-      console.log(`Status do pedido ${id} é 'concluido'. Zerando saldo dos itens...`);
       const updateItensSql = `
         UPDATE itens_pedidos
         SET quantidadeEntregue = quantidadePedido
@@ -557,7 +523,6 @@ app.put('/pedidos/:id', async (req, res) => {
         RETURNING *
       `;
       const itensResult = await client.query(updateItensSql, [id]);
-      console.log(`Itens do pedido ${id} atualizados:`, itensResult.rows);
 
       const historicoSql = `
         INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
@@ -568,17 +533,12 @@ app.put('/pedidos/:id', async (req, res) => {
       for (const item of itensResult.rows) {
         const quantidadeEntregue = item.quantidadepedido;
         if (quantidadeEntregue > 0) {
-          const historicoResult = await client.query(historicoSql, [id, item.id, quantidadeEntregue, dataEdicao]);
-          console.log(`Registro inserido no histórico para item ${item.id}:`, historicoResult.rows[0]);
+          await client.query(historicoSql, [id, item.id, quantidadeEntregue, dataEdicao]);
         }
       }
     }
 
     if (itens && Array.isArray(itens)) {
-      const totalItens = itens.length;
-      console.log(`Atualizando ${totalItens} itens para o pedido ${id}`);
-
-      // Buscar os itens existentes no banco para o pedido
       const itensExistentes = await client.query('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [id]);
       const itensExistentesMap = new Map(itensExistentes.rows.map(item => [item.codigodesenho, item]));
 
@@ -601,18 +561,13 @@ app.put('/pedidos/:id', async (req, res) => {
 
       for (const item of itens) {
         const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-        console.log(`Processando item:`, { itemId, codigoDesenho, quantidadePedido, quantidadeEntregue });
-
         let updatedItem;
-        // Verificar se já existe um item com o mesmo código no banco
         const itemExistente = itensExistentesMap.get(codigoDesenho);
         if (itemExistente) {
-          // Calcular a diferença na quantidade entregue
           const quantidadeEntregueAnterior = itemExistente.quantidadeentregue || 0;
           const novaQuantidadeEntregue = parseInt(quantidadeEntregue || 0, 10);
           const quantidadeAdicionada = novaQuantidadeEntregue - quantidadeEntregueAnterior;
 
-          // Atualizar o item existente
           const itemResult = await client.query(itemSql, [
             codigoDesenho,
             quantidadePedido,
@@ -621,21 +576,17 @@ app.put('/pedidos/:id', async (req, res) => {
             itemExistente.id
           ]);
           updatedItem = itemResult.rows[0];
-          console.log(`Item existente ${itemExistente.id} atualizado:`, updatedItem);
 
-          // Registrar a diferença no histórico, se houver
           if (quantidadeAdicionada > 0) {
             const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-            const historicoResult = await client.query(historicoSql, [
+            await client.query(historicoSql, [
               id,
               updatedItem.id,
-              quantidadeAdicionada, // Registrar apenas a quantidade adicionada
+              quantidadeAdicionada,
               dataEdicao
             ]);
-            console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
           }
         } else {
-          // Se não existe, inserir um novo item
           const itemResult = await client.query(insertItemSql, [
             id,
             codigoDesenho,
@@ -643,28 +594,23 @@ app.put('/pedidos/:id', async (req, res) => {
             quantidadeEntregue || 0
           ]);
           updatedItem = itemResult.rows[0];
-          console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
 
-          // Registrar no histórico, se houver quantidade entregue
           if (quantidadeEntregue > 0) {
             const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-            const historicoResult = await client.query(historicoSql, [
+            await client.query(historicoSql, [
               id,
               updatedItem.id,
               quantidadeEntregue,
               dataEdicao
             ]);
-            console.log(`Registro inserido no histórico para item ${updatedItem.id}:`, historicoResult.rows[0]);
           }
         }
       }
 
-      // Opcional: Remover itens que não estão mais na lista enviada
       const codigosEnviados = new Set(itens.map(item => item.codigoDesenho));
       for (const itemExistente of itensExistentes.rows) {
         if (!codigosEnviados.has(itemExistente.codigodesenho)) {
           await client.query('DELETE FROM itens_pedidos WHERE id = $1', [itemExistente.id]);
-          console.log(`Item ${itemExistente.id} removido do pedido ${id}, pois não está mais na lista.`);
         }
       }
     }
@@ -692,7 +638,6 @@ app.put('/pedidos/:id', async (req, res) => {
       }))
     };
 
-    console.log('Itens retornados após atualização do pedido:', pedidoComItens.itens);
     res.status(200).json(pedidoComItens);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -707,13 +652,10 @@ app.delete('/pedidos/:id', async (req, res) => {
   const id = parseInt(req.params.id);
 
   try {
-    console.log('Deletando pedido com id:', id);
     const result = await pool.query('DELETE FROM pedidos WHERE id = $1', [id]);
     if (result.rowCount === 0) {
-      console.error('Pedido não encontrado para exclusão:', id);
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
-    console.log('Pedido excluído:', id);
     res.status(204).send();
   } catch (error) {
     console.error('Erro ao excluir pedido:', error.message, 'Stack:', error.stack);
@@ -724,22 +666,17 @@ app.delete('/pedidos/:id', async (req, res) => {
 app.post('/pedidos', async (req, res) => {
   const { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens } = req.body;
 
-  console.log('Dados recebidos no POST /pedidos:', { empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, itens });
-
   if (!empresa || !numeroOS || !dataEntrada || !previsaoEntrega || !status || !inicio || !Array.isArray(itens) || itens.length === 0) {
-    console.error('Campos obrigatórios ausentes ou itens inválidos:', req.body);
     return res.status(400).json({ message: 'Campos obrigatórios ausentes ou itens inválidos' });
   }
 
   for (const item of itens) {
     if (!item.codigoDesenho || item.codigoDesenho.trim() === '' || item.quantidadePedido === undefined || item.quantidadePedido === null || item.quantidadePedido === '') {
-      console.error('Item inválido:', item);
       return res.status(400).json({ message: 'Todos os itens devem ter código e quantidade pedida válidos' });
     }
     item.quantidadePedido = parseInt(item.quantidadePedido, 10);
     item.quantidadeEntregue = parseInt(item.quantidadeEntregue || 0, 10);
     if (isNaN(item.quantidadePedido) || item.quantidadePedido < 0) {
-      console.error('Quantidade pedida inválida:', item);
       return res.status(400).json({ message: 'Quantidade pedida deve ser um número positivo' });
     }
   }
@@ -758,13 +695,11 @@ app.post('/pedidos', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    console.log('Inserindo pedido principal com valores:', pedidoValues);
     const result = await client.query(pedidoSql, pedidoValues);
     const pedidoId = result.rows[0]?.id;
     if (!pedidoId) {
       throw new Error('Falha ao inserir pedido: ID não retornado');
     }
-    console.log('Pedido inserido com ID:', pedidoId);
 
     const itemSql = `
       INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
@@ -776,27 +711,19 @@ app.post('/pedidos', async (req, res) => {
       VALUES ($1, $2, $3, $4)
       RETURNING *
     `;
-    const totalItens = itens.length;
 
     for (const item of itens) {
       const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-      console.log('Inserindo item:', { pedido_id: pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue });
       const itemResult = await client.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
-      console.log('Resultado da inserção do item:', itemResult);
       if (!itemResult.rows || itemResult.rows.length === 0) {
         throw new Error('Falha ao inserir item: Nenhum ID retornado');
       }
       const itemId = itemResult.rows[0].id;
       if (quantidadeEntregue > 0) {
         const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
-        console.log('Tentando inserir no histórico:', { pedido_id: pedidoId, item_id: itemId, quantidadeEntregue, dataEdicao });
-        const historicoResult = await client.query(historicoSql, [pedidoId, itemId, quantidadeEntregue, dataEdicao]);
-        console.log('Registro inserido no histórico:', historicoResult.rows[0]);
-      } else {
-        console.log('Quantidade entregue é 0, pulando inserção no histórico para item:', itemId);
+        await client.query(historicoSql, [pedidoId, itemId, quantidadeEntregue, dataEdicao]);
       }
     }
-    console.log(`Todos os ${totalItens} itens inseridos com sucesso`);
 
     await client.query('COMMIT');
 
@@ -814,7 +741,6 @@ app.post('/pedidos', async (req, res) => {
       pausado: '0', 
       itens 
     };
-    console.log('Novo pedido retornado:', novoPedido);
     res.status(201).json(novoPedido);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -828,10 +754,7 @@ app.post('/pedidos', async (req, res) => {
 app.post('/enviar-email', async (req, res) => {
   const { pedido, observacao, quantidadesEditadas } = req.body;
 
-  console.log('Dados recebidos no POST /enviar-email:', { pedido, observacao, quantidadesEditadas });
-
   if (!pedido || !pedido.numeroOS) {
-    console.error('Erro: Nenhum pedido ou numeroOS fornecido para envio de e-mail');
     return res.status(400).json({ message: 'Dados do pedido inválidos ou número da OS não fornecido' });
   }
 
@@ -847,36 +770,25 @@ app.post('/enviar-email', async (req, res) => {
 
   const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
 
-  // Dividir os destinatários em uma lista e remover elementos vazios
-  const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, ''); // Remove todos os espaços e quebras de linha
-  console.log('EMAIL_TO bruto:', rawEmailTo);
-
+  const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
   const destinatarios = rawEmailTo
     .split(',')
     .map(email => email.trim())
-    .filter(email => email.length > 0 && email.includes('@')); // Garante que o e-mail seja válido
-
-  console.log('Lista de destinatários após split, trim e filtro:', destinatarios);
+    .filter(email => email.length > 0 && email.includes('@'));
 
   if (destinatarios.length === 0) {
-    console.error('Nenhum destinatário válido encontrado em EMAIL_TO');
     return res.status(400).json({ message: 'Nenhum destinatário válido encontrado em EMAIL_TO' });
   }
 
   try {
-    // Enviar e-mails separadamente para cada destinatário
     for (const [index, destinatario] of destinatarios.entries()) {
-      console.log(`Iniciando envio para destinatário ${index + 1}/${destinatarios.length}: ${destinatario}`);
       const mailOptions = {
         from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
         to: destinatario,
         subject,
         text: emailText,
       };
-
-      console.log(`Enviando e-mail para ${destinatario} com opções:`, mailOptions);
-      const info = await transporter.sendMail(mailOptions);
-      console.log(`E-mail enviado para ${destinatario}:`, info.response, 'Message ID:', info.messageId);
+      await transporter.sendMail(mailOptions);
     }
 
     if (observacao && observacao.trim()) {
@@ -886,8 +798,7 @@ app.post('/enviar-email', async (req, res) => {
         VALUES ($1, $2, $3)
         RETURNING *
       `;
-      const result = await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
-      console.log(`Observação salva no histórico para pedido ${pedido.id}:`, result.rows[0]);
+      await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
     }
 
     res.status(200).json({ message: 'E-mails enviados com sucesso' });
@@ -896,7 +807,7 @@ app.post('/enviar-email', async (req, res) => {
     res.status(500).json({ message: 'Erro ao enviar e-mails', error: error.message, stack: error.stack });
   }
 });
-// Escutar em todas as interfaces de rede (0.0.0.0) na porta fornecida pelo Render
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
