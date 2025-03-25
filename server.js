@@ -851,16 +851,28 @@ app.post('/enviar-email', async (req, res) => {
     ? `Observação sobre Pedido ${pedidoFormatado.numeroOS}`
     : `Atualização de Pedido ${pedidoFormatado.numeroOS} - Status: ${pedidoFormatado.status || 'Desconhecido'}`;
 
-  const mailOptions = {
-    from: process.env.EMAIL_USER || 'dcashopecia@gmail.com',
-    to: process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br',
-    subject,
-    text: montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas),
-  };
+  const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
+
+  // Dividir os destinatários em uma lista
+  const destinatarios = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br')
+    .split(',')
+    .map(email => email.trim());
+
+  console.log('Enviando e-mails para:', destinatarios);
 
   try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('E-mail enviado:', info.response);
+    // Enviar e-mails separadamente para cada destinatário
+    for (const destinatario of destinatarios) {
+      const mailOptions = {
+        from: process.env.EMAIL_USER || 'dcashopecia@gmail.com',
+        to: destinatario,
+        subject,
+        text: emailText,
+      };
+
+      const info = await transporter.sendMail(mailOptions);
+      console.log(`E-mail enviado para ${destinatario}:`, info.response);
+    }
 
     if (observacao && observacao.trim()) {
       const dataEdicao = formatDateToLocalISO(new Date(), 'historico_observacao');
@@ -873,13 +885,9 @@ app.post('/enviar-email', async (req, res) => {
       console.log(`Observação salva no histórico para pedido ${pedido.id}:`, result.rows[0]);
     }
 
-    res.status(200).json({ message: 'E-mail enviado com sucesso' });
+    res.status(200).json({ message: 'E-mails enviados com sucesso' });
   } catch (error) {
-    console.error('Erro ao enviar e-mail:', error.message, 'Stack:', error.stack);
-    res.status(500).json({ message: 'Erro ao enviar e-mail', error: error.message, stack: error.stack });
+    console.error('Erro ao enviar e-mails:', error.message, 'Stack:', error.stack);
+    res.status(500).json({ message: 'Erro ao enviar e-mails', error: error.message, stack: error.stack });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
 });
