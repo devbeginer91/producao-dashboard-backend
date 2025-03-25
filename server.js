@@ -332,7 +332,6 @@ app.get('/historico-observacoes/:pedidoId', async (req, res) => {
       ORDER BY dataEdicao ASC
     `, [pedidoId]);
     console.log(`GET /historico-observacoes/${pedidoId} - Resultado da query:`, historico);
-    // Mapear os campos para garantir consistência
     const historicoFormatado = historico.map(entry => ({
       id: entry.id,
       pedido_id: entry.pedido_id,
@@ -415,7 +414,7 @@ app.put('/pedidos/:id', async (req, res) => {
     itens 
   } = req.body;
 
-  console.log('Dados recebidos no PUT /pedidos:', { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status });
+  console.log('Dados recebidos no PUT /pedidos:', { id, empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, itens });
 
   const inicioFormatado = converterFormatoData(inicio);
   const dataConclusaoFormatada = status === 'concluido' && !dataConclusao
@@ -520,8 +519,12 @@ app.put('/pedidos/:id', async (req, res) => {
         RETURNING *
       `;
       for (const item of itens) {
-        if (!item.id) continue;
+        if (!item.id) {
+          console.warn(`Item sem ID encontrado, pulando:`, item);
+          continue;
+        }
         const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        console.log(`Atualizando item ${item.id}:`, { codigoDesenho, quantidadePedido, quantidadeEntregue });
         const itemResult = await client.query(itemSql, [
           codigoDesenho,
           quantidadePedido,
@@ -534,6 +537,7 @@ app.put('/pedidos/:id', async (req, res) => {
           continue;
         }
         const updatedItem = itemResult.rows[0];
+        console.log(`Item ${item.id} atualizado:`, updatedItem);
         if (quantidadeEntregue > 0) {
           const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
           const historicoResult = await client.query(historicoSql, [
