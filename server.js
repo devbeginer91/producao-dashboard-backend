@@ -507,6 +507,11 @@ app.put('/pedidos/:id', async (req, res) => {
     if (itens && Array.isArray(itens)) {
       const totalItens = itens.length;
       console.log(`Atualizando ${totalItens} itens para o pedido ${id}`);
+
+      // Buscar os itens existentes no banco para o pedido
+      const itensExistentes = await client.query('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [id]);
+      const itensExistentesMap = new Map(itensExistentes.rows.map(item => [item.codigodesenho, item]));
+
       const itemSql = `
         UPDATE itens_pedidos
         SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3
@@ -523,11 +528,14 @@ app.put('/pedidos/:id', async (req, res) => {
         VALUES ($1, $2, $3, $4)
         RETURNING *
       `;
+
       for (const item of itens) {
         const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
         console.log(`Processando item:`, { itemId, codigoDesenho, quantidadePedido, quantidadeEntregue });
+
         let updatedItem;
         if (itemId) {
+          // Se o item tem um ID, atualize-o
           const itemResult = await client.query(itemSql, [
             codigoDesenho,
             quantidadePedido,
@@ -542,15 +550,32 @@ app.put('/pedidos/:id', async (req, res) => {
           updatedItem = itemResult.rows[0];
           console.log(`Item ${itemId} atualizado:`, updatedItem);
         } else {
-          const itemResult = await client.query(insertItemSql, [
-            id,
-            codigoDesenho,
-            quantidadePedido,
-            quantidadeEntregue || 0
-          ]);
-          updatedItem = itemResult.rows[0];
-          console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
+          // Se o item não tem ID, verifique se já existe um item com o mesmo código
+          const itemExistente = itensExistentesMap.get(codigoDesenho);
+          if (itemExistente) {
+            // Se já existe um item com o mesmo código, atualize-o
+            const itemResult = await client.query(itemSql, [
+              codigoDesenho,
+              quantidadePedido,
+              quantidadeEntregue || 0,
+              id,
+              itemExistente.id
+            ]);
+            updatedItem = itemResult.rows[0];
+            console.log(`Item existente ${itemExistente.id} atualizado:`, updatedItem);
+          } else {
+            // Se não existe, insira um novo item
+            const itemResult = await client.query(insertItemSql, [
+              id,
+              codigoDesenho,
+              quantidadePedido,
+              quantidadeEntregue || 0
+            ]);
+            updatedItem = itemResult.rows[0];
+            console.log(`Novo item inserido para o pedido ${id}:`, updatedItem);
+          }
         }
+
         if (quantidadeEntregue > 0) {
           const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
           const historicoResult = await client.query(historicoSql, [
