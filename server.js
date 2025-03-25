@@ -853,25 +853,33 @@ app.post('/enviar-email', async (req, res) => {
 
   const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
 
-  // Dividir os destinatários em uma lista
+  // Dividir os destinatários em uma lista e remover elementos vazios
   const destinatarios = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br')
     .split(',')
-    .map(email => email.trim());
+    .map(email => email.trim())
+    .filter(email => email.length > 0);
 
-  console.log('Enviando e-mails para:', destinatarios);
+  console.log('Lista de destinatários após split, trim e filtro:', destinatarios);
+
+  if (destinatarios.length === 0) {
+    console.error('Nenhum destinatário válido encontrado em EMAIL_TO');
+    return res.status(400).json({ message: 'Nenhum destinatário válido encontrado em EMAIL_TO' });
+  }
 
   try {
     // Enviar e-mails separadamente para cada destinatário
-    for (const destinatario of destinatarios) {
+    for (const [index, destinatario] of destinatarios.entries()) {
+      console.log(`Iniciando envio para destinatário ${index + 1}/${destinatarios.length}: ${destinatario}`);
       const mailOptions = {
-        from: process.env.EMAIL_USER || 'dcashopecia@gmail.com',
+        from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
         to: destinatario,
         subject,
         text: emailText,
       };
 
+      console.log(`Enviando e-mail para ${destinatario} com opções:`, mailOptions);
       const info = await transporter.sendMail(mailOptions);
-      console.log(`E-mail enviado para ${destinatario}:`, info.response);
+      console.log(`E-mail enviado para ${destinatario}:`, info.response, 'Message ID:', info.messageId);
     }
 
     if (observacao && observacao.trim()) {
