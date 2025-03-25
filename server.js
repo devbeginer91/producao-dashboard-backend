@@ -891,3 +891,7 @@ app.post('/enviar-email', async (req, res) => {
     res.status(500).json({ message: 'Erro ao enviar e-mails', error: error.message, stack: error.stack });
   }
 });
+// Escutar em todas as interfaces de rede (0.0.0.0) na porta fornecida pelo Render
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
