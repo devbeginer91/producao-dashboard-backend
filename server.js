@@ -773,7 +773,7 @@ app.post('/enviar-email', async (req, res) => {
 
   const emailText = montarEmail(pedidoFormatado, pedidoFormatado.itens || [], observacao, quantidadesEditadas);
 
-  const rawEmailTo = (process.env.EMAIL_TO || 'dca@dcachicoteseletricos.com.br').replace(/\s+/g, '');
+  const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
   const destinatarios = rawEmailTo
     .split(',')
     .map(email => email.trim())
