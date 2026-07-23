@@ -33,7 +33,7 @@ app.use((req, res, next) => {
 });
 
 app.use(cors({
-  origin: 'https://producao-dashboard-frontend.onrender.com',
+  origin: ['https://producao-dashboard-frontend.onrender.com', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -47,8 +47,12 @@ app.use((req, res, next) => {
   next();
 });
 
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL must be set in the environment');
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://producao_dashboard_db_user:CiMFfDpnp8etmNOPpgVVELSwzTtHeJ12@dpg-cvc5vl3tq21c73dlt630-a.oregon-postgres.render.com/producao_dashboard_db',
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
@@ -206,6 +210,19 @@ const transporter = nodemailer.createTransport({
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
+});
+
+if (!process.env.AUTH_USERNAME || !process.env.AUTH_PASSWORD) {
+  throw new Error('AUTH_USERNAME and AUTH_PASSWORD must be set in the environment');
+}
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === process.env.AUTH_USERNAME && password === process.env.AUTH_PASSWORD) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ success: false });
+  }
 });
 
 app.get('/pedidos', async (req, res) => {
