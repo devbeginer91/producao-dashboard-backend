@@ -196,11 +196,15 @@ const montarEmail = (pedido, itens, observacao, quantidadesEditadas) => {
   return `${observacaoText}${detalhesPedido}${quantidadesEditadasText}`.trim();
 };
 
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+  throw new Error('EMAIL_USER and EMAIL_PASS must be set in the environment');
+}
+
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER || 'dcashopecia@gmail.com',
-    pass: process.env.EMAIL_PASS || 'swxr dcjg xudk tcdz',
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
   },
 });
 
