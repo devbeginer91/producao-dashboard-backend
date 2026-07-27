@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const multer = require('multer');
+const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { parseChicoteWorkbook } = require('./importParser');
 require('dotenv').config();
@@ -177,6 +178,29 @@ const initializeDatabase = async () => {
         FOREIGN KEY (chicote_id) REFERENCES chicotes(id) ON DELETE CASCADE
       )
     `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS usuarios_pcp (
+        id SERIAL PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        senhaHash TEXT NOT NULL,
+        nome TEXT NOT NULL,
+        criadoEm TEXT NOT NULL
+      )
+    `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS colaboradores (
+        id SERIAL PRIMARY KEY,
+        matricula TEXT NOT NULL UNIQUE,
+        nome TEXT NOT NULL,
+        setor TEXT NOT NULL,
+        criadoEm TEXT NOT NULL
+      )
+    `);
+
+    await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS chicote_id INTEGER REFERENCES chicotes(id)`);
+    await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -252,6 +276,84 @@ app.post('/login', (req, res) => {
     res.json({ success: true });
   } else {
     res.status(401).json({ success: false });
+  }
+});
+
+app.post('/pcp/usuarios', async (req, res) => {
+  const { username, senha, nome } = req.body;
+  if (!username || !senha || !nome) {
+    return res.status(400).json({ message: 'Usuário, senha e nome são obrigatórios.' });
+  }
+  try {
+    const senhaHash = await bcrypt.hash(senha, 10);
+    const criadoEm = formatDateToLocalISO(new Date(), 'pcp-usuario');
+    const result = await db.get(
+      'INSERT INTO usuarios_pcp (username, senhaHash, nome, criadoEm) VALUES ($1, $2, $3, $4) RETURNING id, username, nome',
+      [username, senhaHash, nome, criadoEm]
+    );
+    res.status(201).json(result);
+  } catch (error) {
+    if (error.message.includes('duplicate key')) {
+      return res.status(409).json({ message: 'Já existe uma conta de PCP com esse usuário.' });
+    }
+    console.error('Erro ao criar usuário PCP:', error.message);
+    res.status(500).json({ message: 'Erro ao criar usuário PCP', error: error.message });
+  }
+});
+
+app.post('/pcp/login', async (req, res) => {
+  const { username, senha } = req.body;
+  try {
+    const usuario = await db.get('SELECT id, username, nome, senhahash FROM usuarios_pcp WHERE username = $1', [username]);
+    if (!usuario) {
+      return res.status(401).json({ message: 'Usuário ou senha incorretos.' });
+    }
+    const senhaCorreta = await bcrypt.compare(senha || '', usuario.senhahash);
+    if (!senhaCorreta) {
+      return res.status(401).json({ message: 'Usuário ou senha incorretos.' });
+    }
+    res.json({ id: usuario.id, username: usuario.username, nome: usuario.nome });
+  } catch (error) {
+    console.error('Erro ao autenticar PCP:', error.message);
+    res.status(500).json({ message: 'Erro ao autenticar', error: error.message });
+  }
+});
+
+app.post('/colaboradores', async (req, res) => {
+  const { matricula, nome, setor } = req.body;
+  if (!matricula || !nome || !setor) {
+    return res.status(400).json({ message: 'Matrícula, nome e setor são obrigatórios.' });
+  }
+  try {
+    const criadoEm = formatDateToLocalISO(new Date(), 'colaborador');
+    const result = await db.get(
+      'INSERT INTO colaboradores (matricula, nome, setor, criadoEm) VALUES ($1, $2, $3, $4) RETURNING id, matricula, nome, setor',
+      [matricula, nome, setor, criadoEm]
+    );
+    res.status(201).json(result);
+  } catch (error) {
+    if (error.message.includes('duplicate key')) {
+      return res.status(409).json({ message: 'Já existe um colaborador cadastrado com essa matrícula.' });
+    }
+    console.error('Erro ao cadastrar colaborador:', error.message);
+    res.status(500).json({ message: 'Erro ao cadastrar colaborador', error: error.message });
+  }
+});
+
+app.post('/colaboradores/login', async (req, res) => {
+  const { matricula, senha } = req.body;
+  if (senha !== process.env.COLABORADOR_SENHA_PADRAO) {
+    return res.status(401).json({ message: 'Matrícula ou senha incorretos.' });
+  }
+  try {
+    const colaborador = await db.get('SELECT id, matricula, nome, setor FROM colaboradores WHERE matricula = $1', [matricula]);
+    if (!colaborador) {
+      return res.status(401).json({ message: 'Matrícula ou senha incorretos.' });
+    }
+    res.json(colaborador);
+  } catch (error) {
+    console.error('Erro ao autenticar colaborador:', error.message);
+    res.status(500).json({ message: 'Erro ao autenticar', error: error.message });
   }
 });
 
@@ -410,6 +512,97 @@ app.post('/chicotes/import/confirm', async (req, res) => {
   }
 
   res.json({ resultados });
+});
+
+app.get('/chicotes', async (req, res) => {
+  try {
+    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente, codigoDca FROM chicotes ORDER BY cliente, codigoItemCliente');
+    res.json(chicotes.map((c) => ({
+      id: c.id,
+      cliente: c.cliente,
+      codigoItemCliente: c.codigoitemcliente,
+      codigoDca: c.codigodca,
+    })));
+  } catch (error) {
+    console.error('Erro ao listar chicotes:', error.message);
+    res.status(500).json({ message: 'Erro ao listar chicotes', error: error.message });
+  }
+});
+
+app.get('/itens-pedidos', async (req, res) => {
+  try {
+    const itens = await db.all(`
+      SELECT ip.id, ip.pedido_id, ip.codigoDesenho, ip.chicote_id, ip.prioritario,
+             p.empresa, p.numeroOS, p.status
+      FROM itens_pedidos ip
+      JOIN pedidos p ON p.id = ip.pedido_id
+      WHERE p.status IN ('novo', 'andamento')
+      ORDER BY p.empresa, p.numeroOS
+    `);
+    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente, codigoDca FROM chicotes');
+
+    const normaliza = (s) => String(s || '').trim().toUpperCase();
+    const paraChicoteResumo = (c) => (c ? { id: c.id, codigoItemCliente: c.codigoitemcliente, codigoDca: c.codigodca } : null);
+
+    const resultado = itens.map((item) => {
+      const chicoteVinculado = item.chicote_id ? chicotes.find((c) => c.id === item.chicote_id) : null;
+
+      let chicoteSugerido = null;
+      if (!item.chicote_id) {
+        chicoteSugerido = chicotes.find(
+          (c) => normaliza(c.cliente) === normaliza(item.empresa) && normaliza(c.codigoitemcliente) === normaliza(item.codigodesenho)
+        ) || null;
+      }
+
+      return {
+        id: item.id,
+        pedidoId: item.pedido_id,
+        empresa: item.empresa,
+        numeroOS: item.numeroos,
+        status: item.status,
+        codigoDesenho: item.codigodesenho,
+        prioritario: item.prioritario === 1 || item.prioritario === true,
+        chicoteId: item.chicote_id,
+        chicoteVinculado: paraChicoteResumo(chicoteVinculado),
+        chicoteSugerido: paraChicoteResumo(chicoteSugerido),
+      };
+    });
+
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar itens de pedido:', error.message);
+    res.status(500).json({ message: 'Erro ao listar itens de pedido', error: error.message });
+  }
+});
+
+app.put('/itens-pedidos/:id/chicote', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { chicoteId } = req.body;
+  try {
+    const result = await db.run('UPDATE itens_pedidos SET chicote_id = $1 WHERE id = $2', [chicoteId || null, id]);
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Item de pedido não encontrado' });
+    }
+    res.json({ id, chicoteId: chicoteId || null });
+  } catch (error) {
+    console.error('Erro ao vincular chicote:', error.message);
+    res.status(500).json({ message: 'Erro ao vincular chicote', error: error.message });
+  }
+});
+
+app.put('/itens-pedidos/:id/prioridade', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { prioritario } = req.body;
+  try {
+    const result = await db.run('UPDATE itens_pedidos SET prioritario = $1 WHERE id = $2', [prioritario ? 1 : 0, id]);
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Item de pedido não encontrado' });
+    }
+    res.json({ id, prioritario: !!prioritario });
+  } catch (error) {
+    console.error('Erro ao atualizar prioridade:', error.message);
+    res.status(500).json({ message: 'Erro ao atualizar prioridade', error: error.message });
+  }
 });
 
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
