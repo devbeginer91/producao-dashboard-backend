@@ -229,6 +229,8 @@ app.get('/pedidos', async (req, res) => {
   try {
     const pedidos = await db.all('SELECT * FROM pedidos');
     const itens = await db.all('SELECT * FROM itens_pedidos');
+    const obsCounts = await db.all('SELECT pedido_id, COUNT(*)::int AS count FROM historico_observacoes GROUP BY pedido_id');
+    const obsCountMap = new Map(obsCounts.map(o => [o.pedido_id, o.count]));
     const pedidosComItens = pedidos.map(pedido => {
       const tempoPausado = Number(pedido.tempopausado) || 0;
       let tempoFinal = tempoPausado;
@@ -254,6 +256,7 @@ app.get('/pedidos', async (req, res) => {
         tempo: tempoFinal,
         tempoPausado: tempoPausado,
         pausado: pedido.pausado ? pedido.pausado.toString() : '0',
+        observacoesCount: obsCountMap.get(pedido.id) || 0,
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
           codigoDesenho: item.codigodesenho,
