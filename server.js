@@ -28,6 +28,18 @@ const calcularTempo = (inicio, fim = formatDateToLocalISO(new Date())) => {
   return diffMs < 0 ? 0 : Math.round(diffMs / (1000 * 60));
 };
 
+// Como calcularTempo, mas em segundos — usado pelo cronômetro de execução de
+// etapa, onde arredondar pra minuto inteiro perde precisão demais.
+const calcularTempoSegundos = (inicio, fim = formatDateToLocalISO(new Date())) => {
+  const inicioDate = new Date(inicio);
+  const fimDate = new Date(fim);
+  if (isNaN(inicioDate) || isNaN(fimDate)) {
+    return 0;
+  }
+  const diffMs = fimDate - inicioDate;
+  return diffMs < 0 ? 0 : Math.round(diffMs / 1000);
+};
+
 app.use((req, res, next) => {
   res.setHeader(
     "Content-Security-Policy",
@@ -741,7 +753,7 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
       return res.status(400).json({ message: 'Essa etapa não está em andamento.' });
     }
     const agora = formatDateToLocalISO(new Date(), 'pausar-etapa');
-    const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempo(exec.datapausada || exec.inicio, agora);
+    const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
     await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, agora, id]);
     res.json({ id, status: 'pausado', tempoAcumulado: Math.round(novoTempo) });
   } catch (error) {
@@ -785,7 +797,7 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
     const agora = formatDateToLocalISO(new Date(), 'concluir-etapa');
     let tempoFinal = Number(exec.tempoacumulado) || 0;
     if (exec.status === 'em_andamento') {
-      tempoFinal += calcularTempo(exec.datapausada || exec.inicio, agora);
+      tempoFinal += calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
     }
     await db.run("UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2 WHERE id = $3", [tempoFinal, agora, id]);
     res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal) });
