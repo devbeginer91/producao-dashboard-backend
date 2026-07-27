@@ -1,10 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+const multer = require('multer');
 const { Pool } = require('pg');
+const { parseChicoteWorkbook } = require('./importParser');
 require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
+const upload = multer({ storage: multer.memoryStorage() });
 
 const formatDateToLocalISO = (date, context = 'unknown') => {
   const d = date ? new Date(date) : new Date();
@@ -147,6 +150,33 @@ const initializeDatabase = async () => {
         FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE
       )
     `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS chicotes (
+        id SERIAL PRIMARY KEY,
+        cliente TEXT NOT NULL,
+        codigoItemCliente TEXT NOT NULL,
+        codigoDca TEXT,
+        arquivoOrigem TEXT,
+        criadoEm TEXT NOT NULL,
+        atualizadoEm TEXT NOT NULL,
+        UNIQUE (cliente, codigoItemCliente)
+      )
+    `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS etapas_chicote (
+        id SERIAL PRIMARY KEY,
+        chicote_id INTEGER NOT NULL,
+        ordem INTEGER NOT NULL,
+        nome TEXT NOT NULL,
+        setor TEXT,
+        quemTexto TEXT,
+        colaboradores INTEGER,
+        instrucoes TEXT,
+        FOREIGN KEY (chicote_id) REFERENCES chicotes(id) ON DELETE CASCADE
+      )
+    `);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -270,6 +300,116 @@ app.get('/pedidos', async (req, res) => {
     console.error('Erro ao listar pedidos:', err.message);
     res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
   }
+});
+
+app.post('/chicotes/import/preview', upload.array('arquivos'), async (req, res) => {
+  try {
+    const arquivos = req.files || [];
+    if (arquivos.length === 0) {
+      return res.status(400).json({ message: 'Nenhum arquivo enviado.' });
+    }
+
+    const resultados = [];
+    for (const arquivo of arquivos) {
+      let parsed;
+      try {
+        parsed = parseChicoteWorkbook(arquivo.buffer, arquivo.originalname);
+      } catch (parseErr) {
+        resultados.push({
+          arquivo: arquivo.originalname,
+          erroLeitura: parseErr.message,
+        });
+        continue;
+      }
+
+      let existente = false;
+      let chicoteIdExistente = null;
+      if (parsed.chicote.cliente && parsed.chicote.codigoItemCliente) {
+        const row = await db.get(
+          'SELECT id FROM chicotes WHERE cliente = $1 AND codigoItemCliente = $2',
+          [parsed.chicote.cliente, parsed.chicote.codigoItemCliente]
+        );
+        if (row) {
+          existente = true;
+          chicoteIdExistente = row.id;
+        }
+      }
+
+      resultados.push({ ...parsed, existente, chicoteIdExistente });
+    }
+
+    res.json({ resultados });
+  } catch (error) {
+    console.error('Erro ao analisar arquivos de chicote:', error.message, 'Stack:', error.stack);
+    res.status(500).json({ message: 'Erro ao analisar arquivos', error: error.message, stack: error.stack });
+  }
+});
+
+app.post('/chicotes/import/confirm', async (req, res) => {
+  const { itens } = req.body;
+  if (!Array.isArray(itens) || itens.length === 0) {
+    return res.status(400).json({ message: 'Nenhum item para importar.' });
+  }
+
+  const resultados = [];
+  const agora = formatDateToLocalISO(new Date(), 'import-chicote');
+
+  for (const item of itens) {
+    const { arquivo, chicote, etapas } = item;
+    const client = await pool.connect();
+    try {
+      if (!chicote || !chicote.cliente || !chicote.codigoItemCliente) {
+        throw new Error('Cliente e código do item cliente são obrigatórios.');
+      }
+
+      await client.query('BEGIN');
+
+      const upsertSql = `
+        INSERT INTO chicotes (cliente, codigoItemCliente, codigoDca, arquivoOrigem, criadoEm, atualizadoEm)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT (cliente, codigoItemCliente)
+        DO UPDATE SET codigoDca = $3, arquivoOrigem = $4, atualizadoEm = $5
+        RETURNING id
+      `;
+      const upsertResult = await client.query(upsertSql, [
+        chicote.cliente,
+        chicote.codigoItemCliente,
+        chicote.codigoDca || null,
+        arquivo || null,
+        agora,
+      ]);
+      const chicoteId = upsertResult.rows[0].id;
+
+      await client.query('DELETE FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+
+      const etapaSql = `
+        INSERT INTO etapas_chicote (chicote_id, ordem, nome, setor, quemTexto, colaboradores, instrucoes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `;
+      for (const etapa of etapas || []) {
+        await client.query(etapaSql, [
+          chicoteId,
+          etapa.ordem,
+          etapa.nome,
+          etapa.setor || null,
+          etapa.quemTexto || null,
+          etapa.colaboradores,
+          etapa.instrucoes || null,
+        ]);
+      }
+
+      await client.query('COMMIT');
+      resultados.push({ arquivo, sucesso: true, chicoteId });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Erro ao importar chicote:', arquivo, error.message);
+      resultados.push({ arquivo, sucesso: false, erro: error.message });
+    } finally {
+      client.release();
+    }
+  }
+
+  res.json({ resultados });
 });
 
 app.get('/historico-entregas/:pedidoId', async (req, res) => {

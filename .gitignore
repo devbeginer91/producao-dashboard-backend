@@ -25,3 +25,6 @@ yarn-error.log*
 
 
 pedidos.db
+
+# arquivos de exemplo pra importação (dados de cliente, não versionar)
+/importacao
