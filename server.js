@@ -201,6 +201,23 @@ const initializeDatabase = async () => {
 
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS chicote_id INTEGER REFERENCES chicotes(id)`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS execucoes_etapa (
+        id SERIAL PRIMARY KEY,
+        item_pedido_id INTEGER NOT NULL,
+        etapa_chicote_id INTEGER NOT NULL,
+        colaborador_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'em_andamento',
+        inicio TEXT NOT NULL,
+        tempoAcumulado FLOAT DEFAULT 0,
+        dataPausada TEXT,
+        dataConclusao TEXT,
+        FOREIGN KEY (item_pedido_id) REFERENCES itens_pedidos(id) ON DELETE CASCADE,
+        FOREIGN KEY (etapa_chicote_id) REFERENCES etapas_chicote(id) ON DELETE CASCADE,
+        FOREIGN KEY (colaborador_id) REFERENCES colaboradores(id) ON DELETE CASCADE
+      )
+    `);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -602,6 +619,179 @@ app.put('/itens-pedidos/:id/prioridade', async (req, res) => {
   } catch (error) {
     console.error('Erro ao atualizar prioridade:', error.message);
     res.status(500).json({ message: 'Erro ao atualizar prioridade', error: error.message });
+  }
+});
+
+app.get('/ordens-producao', async (req, res) => {
+  const colaboradorId = parseInt(req.query.colaboradorId);
+  if (!colaboradorId) {
+    return res.status(400).json({ message: 'colaboradorId é obrigatório.' });
+  }
+  try {
+    const itens = await db.all(`
+      SELECT ip.id, ip.pedido_id, ip.chicote_id, p.empresa, p.numeroOS, p.status
+      FROM itens_pedidos ip
+      JOIN pedidos p ON p.id = ip.pedido_id
+      WHERE ip.prioritario = 1 AND p.status IN ('novo', 'andamento') AND ip.chicote_id IS NOT NULL
+      ORDER BY p.empresa, p.numeroOS
+    `);
+
+    if (itens.length === 0) {
+      return res.json([]);
+    }
+
+    const chicoteIds = [...new Set(itens.map((i) => i.chicote_id))];
+    const itemIds = itens.map((i) => i.id);
+
+    const etapas = await db.all(
+      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+      [chicoteIds]
+    );
+    const execucoes = await db.all(
+      'SELECT * FROM execucoes_etapa WHERE colaborador_id = $1 AND item_pedido_id = ANY($2::int[])',
+      [colaboradorId, itemIds]
+    );
+
+    const agora = formatDateToLocalISO(new Date(), 'ordens-producao');
+
+    const calcularExecucao = (exec) => {
+      if (!exec) return null;
+      const base = Math.round(Number(exec.tempoacumulado) || 0);
+      if (exec.status === 'em_andamento') {
+        return {
+          id: exec.id,
+          status: exec.status,
+          tempoAcumuladoBase: base,
+          referenciaInicio: exec.datapausada || exec.inicio,
+        };
+      }
+      return { id: exec.id, status: exec.status, tempoAcumulado: base };
+    };
+
+    const resultado = itens.map((item) => ({
+      id: item.id,
+      pedidoId: item.pedido_id,
+      empresa: item.empresa,
+      numeroOS: item.numeroos,
+      status: item.status,
+      etapas: etapas
+        .filter((e) => e.chicote_id === item.chicote_id)
+        .map((e) => {
+          const execucao = execucoes
+            .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
+            .sort((a, b) => b.id - a.id)[0];
+          return {
+            id: e.id,
+            ordem: e.ordem,
+            nome: e.nome,
+            setor: e.setor,
+            quemTexto: e.quemtexto,
+            instrucoes: e.instrucoes,
+            minhaExecucao: calcularExecucao(execucao),
+          };
+        }),
+    }));
+
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar ordens de produção:', error.message);
+    res.status(500).json({ message: 'Erro ao listar ordens de produção', error: error.message });
+  }
+});
+
+app.post('/execucoes-etapa/iniciar', async (req, res) => {
+  const { itemPedidoId, etapaChicoteId, colaboradorId } = req.body;
+  if (!itemPedidoId || !etapaChicoteId || !colaboradorId) {
+    return res.status(400).json({ message: 'itemPedidoId, etapaChicoteId e colaboradorId são obrigatórios.' });
+  }
+  try {
+    const emAndamento = await db.get(
+      "SELECT id FROM execucoes_etapa WHERE colaborador_id = $1 AND status = 'em_andamento'",
+      [colaboradorId]
+    );
+    if (emAndamento) {
+      return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de iniciar essa.' });
+    }
+
+    const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
+    const execucao = await db.get(
+      `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado)
+       VALUES ($1, $2, $3, 'em_andamento', $4, 0) RETURNING id`,
+      [itemPedidoId, etapaChicoteId, colaboradorId, agora]
+    );
+
+    const item = await db.get('SELECT pedido_id FROM itens_pedidos WHERE id = $1', [itemPedidoId]);
+    if (item) {
+      await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
+    }
+
+    res.status(201).json({ id: execucao.id, status: 'em_andamento', tempoAcumuladoBase: 0, referenciaInicio: agora });
+  } catch (error) {
+    console.error('Erro ao iniciar etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao iniciar etapa', error: error.message });
+  }
+});
+
+app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status !== 'em_andamento') {
+      return res.status(400).json({ message: 'Essa etapa não está em andamento.' });
+    }
+    const agora = formatDateToLocalISO(new Date(), 'pausar-etapa');
+    const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempo(exec.datapausada || exec.inicio, agora);
+    await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, agora, id]);
+    res.json({ id, status: 'pausado', tempoAcumulado: Math.round(novoTempo) });
+  } catch (error) {
+    console.error('Erro ao pausar etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao pausar etapa', error: error.message });
+  }
+});
+
+app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status !== 'pausado') {
+      return res.status(400).json({ message: 'Essa etapa não está pausada.' });
+    }
+    const emAndamento = await db.get(
+      "SELECT id FROM execucoes_etapa WHERE colaborador_id = $1 AND status = 'em_andamento'",
+      [exec.colaborador_id]
+    );
+    if (emAndamento) {
+      return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de retomar essa.' });
+    }
+    const agora = formatDateToLocalISO(new Date(), 'retomar-etapa');
+    await db.run("UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE id = $2", [agora, id]);
+    res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
+  } catch (error) {
+    console.error('Erro ao retomar etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao retomar etapa', error: error.message });
+  }
+});
+
+app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status === 'concluido') {
+      return res.status(400).json({ message: 'Essa etapa já foi concluída.' });
+    }
+    const agora = formatDateToLocalISO(new Date(), 'concluir-etapa');
+    let tempoFinal = Number(exec.tempoacumulado) || 0;
+    if (exec.status === 'em_andamento') {
+      tempoFinal += calcularTempo(exec.datapausada || exec.inicio, agora);
+    }
+    await db.run("UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2 WHERE id = $3", [tempoFinal, agora, id]);
+    res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal) });
+  } catch (error) {
+    console.error('Erro ao concluir etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao concluir etapa', error: error.message });
   }
 });
 
