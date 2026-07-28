@@ -692,6 +692,101 @@ app.put('/chicotes/:id', async (req, res) => {
   }
 });
 
+app.post('/chicotes/:id/etapas', async (req, res) => {
+  const chicoteId = parseInt(req.params.id);
+  const { nome, setor, quemTexto, instrucoes, tempoIdeal } = req.body;
+  if (!nome || !nome.trim()) {
+    return res.status(400).json({ message: 'Nome da etapa é obrigatório.' });
+  }
+  try {
+    const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
+    if (!chicote) {
+      return res.status(404).json({ message: 'Chicote não encontrado' });
+    }
+    const ultima = await db.get('SELECT COALESCE(MAX(ordem), 0) AS maxOrdem FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+    const proximaOrdem = (Number(ultima.maxordem) || 0) + 1;
+    const etapa = await db.get(
+      `INSERT INTO etapas_chicote (chicote_id, ordem, nome, setor, quemTexto, instrucoes, tempoIdeal)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [chicoteId, proximaOrdem, nome.trim(), setor || null, quemTexto || null, instrucoes || null, tempoIdeal === '' || tempoIdeal === undefined ? null : tempoIdeal]
+    );
+    res.status(201).json({
+      id: etapa.id,
+      ordem: etapa.ordem,
+      nome: etapa.nome,
+      setor: etapa.setor,
+      quemTexto: etapa.quemtexto,
+      instrucoes: etapa.instrucoes,
+      tempoIdeal: etapa.tempoideal,
+    });
+  } catch (error) {
+    console.error('Erro ao adicionar etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao adicionar etapa', error: error.message });
+  }
+});
+
+app.put('/etapas-chicote/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { nome, setor, quemTexto, instrucoes, tempoIdeal, ordem } = req.body;
+  if (!nome || !nome.trim()) {
+    return res.status(400).json({ message: 'Nome da etapa é obrigatório.' });
+  }
+  try {
+    const result = await db.run(
+      `UPDATE etapas_chicote SET nome = $1, setor = $2, quemTexto = $3, instrucoes = $4, tempoIdeal = $5, ordem = COALESCE($6, ordem)
+       WHERE id = $7`,
+      [nome.trim(), setor || null, quemTexto || null, instrucoes || null, tempoIdeal === '' || tempoIdeal === undefined ? null : tempoIdeal, ordem ?? null, id]
+    );
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Etapa não encontrada' });
+    }
+    res.json({ id });
+  } catch (error) {
+    console.error('Erro ao editar etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao editar etapa', error: error.message });
+  }
+});
+
+app.put('/etapas-chicote/:id/mover', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { direcao } = req.body;
+  if (direcao !== 'cima' && direcao !== 'baixo') {
+    return res.status(400).json({ message: 'Direção inválida. Use "cima" ou "baixo".' });
+  }
+  try {
+    const etapa = await db.get('SELECT * FROM etapas_chicote WHERE id = $1', [id]);
+    if (!etapa) {
+      return res.status(404).json({ message: 'Etapa não encontrada' });
+    }
+    const vizinha = direcao === 'cima'
+      ? await db.get('SELECT * FROM etapas_chicote WHERE chicote_id = $1 AND ordem < $2 ORDER BY ordem DESC LIMIT 1', [etapa.chicote_id, etapa.ordem])
+      : await db.get('SELECT * FROM etapas_chicote WHERE chicote_id = $1 AND ordem > $2 ORDER BY ordem ASC LIMIT 1', [etapa.chicote_id, etapa.ordem]);
+    if (!vizinha) {
+      return res.status(400).json({ message: 'Essa etapa já está na ponta da lista.' });
+    }
+    await db.run('UPDATE etapas_chicote SET ordem = $1 WHERE id = $2', [vizinha.ordem, etapa.id]);
+    await db.run('UPDATE etapas_chicote SET ordem = $1 WHERE id = $2', [etapa.ordem, vizinha.id]);
+    res.json({ id, ordem: vizinha.ordem });
+  } catch (error) {
+    console.error('Erro ao mover etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao mover etapa', error: error.message });
+  }
+});
+
+app.delete('/etapas-chicote/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const result = await db.run('DELETE FROM etapas_chicote WHERE id = $1', [id]);
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Etapa não encontrada' });
+    }
+    res.json({ id });
+  } catch (error) {
+    console.error('Erro ao remover etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao remover etapa', error: error.message });
+  }
+});
+
 // Rotina de carga inicial: garante que todo item de pedido novo/andamento
 // já tenha um chicote correspondente (criando um vazio se ainda não existir
 // nenhum pra aquele cliente+código). Idempotente — só mexe em itens sem
