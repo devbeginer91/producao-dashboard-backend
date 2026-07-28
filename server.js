@@ -615,7 +615,12 @@ app.post('/chicotes/sincronizar-pedidos-existentes', async (req, res) => {
     const agora = formatDateToLocalISO(new Date(), 'sincronizar-chicotes');
 
     let criados = 0;
+    let ignorados = 0;
     for (const item of itens) {
+      if (!item.codigodesenho || !item.codigodesenho.trim()) {
+        ignorados++;
+        continue;
+      }
       let chicote = chicotes.find(
         (c) => normaliza(c.cliente) === normaliza(item.empresa) && normaliza(c.codigoitemcliente) === normaliza(item.codigodesenho)
       );
@@ -623,7 +628,7 @@ app.post('/chicotes/sincronizar-pedidos-existentes', async (req, res) => {
         const novo = await db.get(
           `INSERT INTO chicotes (cliente, codigoItemCliente, criadoEm, atualizadoEm)
            VALUES ($1, $2, $3, $3) RETURNING id, cliente, codigoItemCliente`,
-          [item.empresa, item.codigoDesenho, agora]
+          [item.empresa, item.codigodesenho, agora]
         );
         chicote = { id: novo.id, cliente: novo.cliente, codigoitemcliente: novo.codigoitemcliente };
         chicotes.push(chicote);
@@ -632,7 +637,7 @@ app.post('/chicotes/sincronizar-pedidos-existentes', async (req, res) => {
       await db.run('UPDATE itens_pedidos SET chicote_id = $1 WHERE id = $2', [chicote.id, item.id]);
     }
 
-    res.json({ itensProcessados: itens.length, chicotesCriados: criados });
+    res.json({ itensProcessados: itens.length, chicotesCriados: criados, itensIgnorados: ignorados });
   } catch (error) {
     console.error('Erro ao sincronizar chicotes:', error.message);
     res.status(500).json({ message: 'Erro ao sincronizar chicotes', error: error.message });
