@@ -376,11 +376,6 @@ app.post('/colaboradores', async (req, res) => {
   }
 });
 
-app.get('/debug/senha-padrao', (req, res) => {
-  const v = process.env.COLABORADOR_SENHA_PADRAO;
-  res.json({ configurada: v !== undefined, tamanho: v ? v.length : 0 });
-});
-
 app.post('/colaboradores/login', async (req, res) => {
   const { matricula, senha } = req.body;
   if (senha !== process.env.COLABORADOR_SENHA_PADRAO) {
