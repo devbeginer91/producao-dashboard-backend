@@ -230,6 +230,13 @@ const initializeDatabase = async () => {
         FOREIGN KEY (colaborador_id) REFERENCES colaboradores(id) ON DELETE CASCADE
       )
     `);
+
+    // Prioridade/ordem migrou de itens_pedidos pra pedidos (item.prioritario fica sem uso a partir daqui)
+    await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
+    await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS ordemPrioridade INTEGER`);
+
+    await db.run(`ALTER TABLE chicotes ADD COLUMN IF NOT EXISTS tempoIdeal FLOAT`);
+    await db.run(`ALTER TABLE etapas_chicote ADD COLUMN IF NOT EXISTS tempoIdeal FLOAT`);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -417,6 +424,8 @@ app.get('/pedidos', async (req, res) => {
         tempo: tempoFinal,
         tempoPausado: tempoPausado,
         pausado: pedido.pausado ? pedido.pausado.toString() : '0',
+        prioritario: pedido.prioritario === 1 || pedido.prioritario === true,
+        ordemPrioridade: pedido.ordemprioridade,
         observacoesCount: obsCountMap.get(pedido.id) || 0,
         itens: itens.filter(item => item.pedido_id === pedido.id).map(item => ({
           ...item,
@@ -430,6 +439,36 @@ app.get('/pedidos', async (req, res) => {
   } catch (err) {
     console.error('Erro ao listar pedidos:', err.message);
     res.status(500).json({ message: 'Erro ao listar pedidos', error: err.message });
+  }
+});
+
+app.put('/pedidos/:id/prioridade', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { prioritario } = req.body;
+  try {
+    const result = await db.run('UPDATE pedidos SET prioritario = $1 WHERE id = $2', [prioritario ? 1 : 0, id]);
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Pedido não encontrado' });
+    }
+    res.json({ id, prioritario: !!prioritario });
+  } catch (error) {
+    console.error('Erro ao atualizar prioridade do pedido:', error.message);
+    res.status(500).json({ message: 'Erro ao atualizar prioridade do pedido', error: error.message });
+  }
+});
+
+app.put('/pedidos/:id/ordem-prioridade', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { ordemPrioridade } = req.body;
+  try {
+    const result = await db.run('UPDATE pedidos SET ordemPrioridade = $1 WHERE id = $2', [ordemPrioridade ?? null, id]);
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Pedido não encontrado' });
+    }
+    res.json({ id, ordemPrioridade: ordemPrioridade ?? null });
+  } catch (error) {
+    console.error('Erro ao atualizar ordem de prioridade:', error.message);
+    res.status(500).json({ message: 'Erro ao atualizar ordem de prioridade', error: error.message });
   }
 });
 
@@ -558,6 +597,48 @@ app.get('/chicotes', async (req, res) => {
   }
 });
 
+// Rotina de carga inicial: garante que todo item de pedido novo/andamento
+// já tenha um chicote correspondente (criando um vazio se ainda não existir
+// nenhum pra aquele cliente+código). Idempotente — só mexe em itens sem
+// chicote_id, então pode ser rodada de novo sem duplicar nada. Não é um
+// gatilho automático permanente: daqui pra frente o vínculo é sempre manual.
+app.post('/chicotes/sincronizar-pedidos-existentes', async (req, res) => {
+  try {
+    const itens = await db.all(`
+      SELECT ip.id, ip.codigoDesenho, p.empresa
+      FROM itens_pedidos ip
+      JOIN pedidos p ON p.id = ip.pedido_id
+      WHERE p.status IN ('novo', 'andamento') AND ip.chicote_id IS NULL
+    `);
+    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente FROM chicotes');
+    const normaliza = (s) => String(s || '').trim().toUpperCase();
+    const agora = formatDateToLocalISO(new Date(), 'sincronizar-chicotes');
+
+    let criados = 0;
+    for (const item of itens) {
+      let chicote = chicotes.find(
+        (c) => normaliza(c.cliente) === normaliza(item.empresa) && normaliza(c.codigoitemcliente) === normaliza(item.codigodesenho)
+      );
+      if (!chicote) {
+        const novo = await db.get(
+          `INSERT INTO chicotes (cliente, codigoItemCliente, criadoEm, atualizadoEm)
+           VALUES ($1, $2, $3, $3) RETURNING id, cliente, codigoItemCliente`,
+          [item.empresa, item.codigoDesenho, agora]
+        );
+        chicote = { id: novo.id, cliente: novo.cliente, codigoitemcliente: novo.codigoitemcliente };
+        chicotes.push(chicote);
+        criados++;
+      }
+      await db.run('UPDATE itens_pedidos SET chicote_id = $1 WHERE id = $2', [chicote.id, item.id]);
+    }
+
+    res.json({ itensProcessados: itens.length, chicotesCriados: criados });
+  } catch (error) {
+    console.error('Erro ao sincronizar chicotes:', error.message);
+    res.status(500).json({ message: 'Erro ao sincronizar chicotes', error: error.message });
+  }
+});
+
 app.get('/itens-pedidos', async (req, res) => {
   try {
     const itens = await db.all(`
@@ -619,37 +700,38 @@ app.put('/itens-pedidos/:id/chicote', async (req, res) => {
   }
 });
 
-app.put('/itens-pedidos/:id/prioridade', async (req, res) => {
-  const id = parseInt(req.params.id);
-  const { prioritario } = req.body;
-  try {
-    const result = await db.run('UPDATE itens_pedidos SET prioritario = $1 WHERE id = $2', [prioritario ? 1 : 0, id]);
-    if (result.changes === 0) {
-      return res.status(404).json({ message: 'Item de pedido não encontrado' });
-    }
-    res.json({ id, prioritario: !!prioritario });
-  } catch (error) {
-    console.error('Erro ao atualizar prioridade:', error.message);
-    res.status(500).json({ message: 'Erro ao atualizar prioridade', error: error.message });
-  }
-});
-
 app.get('/ordens-producao', async (req, res) => {
   const colaboradorId = parseInt(req.query.colaboradorId);
   if (!colaboradorId) {
     return res.status(400).json({ message: 'colaboradorId é obrigatório.' });
   }
   try {
-    const itens = await db.all(`
-      SELECT ip.id, ip.pedido_id, ip.chicote_id, p.empresa, p.numeroOS, p.status
-      FROM itens_pedidos ip
-      JOIN pedidos p ON p.id = ip.pedido_id
-      WHERE ip.prioritario = 1 AND p.status IN ('novo', 'andamento') AND ip.chicote_id IS NOT NULL
-      ORDER BY p.empresa, p.numeroOS
+    const pedidos = await db.all(`
+      SELECT id, empresa, numeroOS, status, ordemPrioridade
+      FROM pedidos
+      WHERE prioritario = 1 AND status IN ('novo', 'andamento')
+      ORDER BY ordemPrioridade ASC NULLS LAST, empresa, numeroOS
     `);
 
-    if (itens.length === 0) {
+    if (pedidos.length === 0) {
       return res.json([]);
+    }
+
+    const pedidoIds = pedidos.map((p) => p.id);
+    const itens = await db.all(
+      'SELECT id, pedido_id, codigoDesenho, chicote_id FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND chicote_id IS NOT NULL',
+      [pedidoIds]
+    );
+
+    if (itens.length === 0) {
+      return res.json(pedidos.map((p) => ({
+        id: p.id,
+        empresa: p.empresa,
+        numeroOS: p.numeroos,
+        status: p.status,
+        ordemPrioridade: p.ordemprioridade,
+        itens: [],
+      })));
     }
 
     const chicoteIds = [...new Set(itens.map((i) => i.chicote_id))];
@@ -663,8 +745,6 @@ app.get('/ordens-producao', async (req, res) => {
       'SELECT * FROM execucoes_etapa WHERE colaborador_id = $1 AND item_pedido_id = ANY($2::int[])',
       [colaboradorId, itemIds]
     );
-
-    const agora = formatDateToLocalISO(new Date(), 'ordens-producao');
 
     const calcularExecucao = (exec) => {
       if (!exec) return null;
@@ -680,28 +760,34 @@ app.get('/ordens-producao', async (req, res) => {
       return { id: exec.id, status: exec.status, tempoAcumulado: base };
     };
 
-    const resultado = itens.map((item) => ({
-      id: item.id,
-      pedidoId: item.pedido_id,
-      empresa: item.empresa,
-      numeroOS: item.numeroos,
-      status: item.status,
-      etapas: etapas
-        .filter((e) => e.chicote_id === item.chicote_id)
-        .map((e) => {
-          const execucao = execucoes
-            .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
-            .sort((a, b) => b.id - a.id)[0];
-          return {
-            id: e.id,
-            ordem: e.ordem,
-            nome: e.nome,
-            setor: e.setor,
-            quemTexto: e.quemtexto,
-            instrucoes: e.instrucoes,
-            minhaExecucao: calcularExecucao(execucao),
-          };
-        }),
+    const resultado = pedidos.map((pedido) => ({
+      id: pedido.id,
+      empresa: pedido.empresa,
+      numeroOS: pedido.numeroos,
+      status: pedido.status,
+      ordemPrioridade: pedido.ordemprioridade,
+      itens: itens
+        .filter((item) => item.pedido_id === pedido.id)
+        .map((item) => ({
+          id: item.id,
+          codigoDesenho: item.codigodesenho,
+          etapas: etapas
+            .filter((e) => e.chicote_id === item.chicote_id)
+            .map((e) => {
+              const execucao = execucoes
+                .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
+                .sort((a, b) => b.id - a.id)[0];
+              return {
+                id: e.id,
+                ordem: e.ordem,
+                nome: e.nome,
+                setor: e.setor,
+                quemTexto: e.quemtexto,
+                instrucoes: e.instrucoes,
+                minhaExecucao: calcularExecucao(execucao),
+              };
+            }),
+        })),
     }));
 
     res.json(resultado);
