@@ -937,8 +937,10 @@ app.get('/ordens-producao', async (req, res) => {
       [chicoteIds]
     );
     const execucoes = await db.all(
-      'SELECT * FROM execucoes_etapa WHERE colaborador_id = $1 AND item_pedido_id = ANY($2::int[])',
-      [colaboradorId, itemIds]
+      `SELECT ex.*, col.nome AS colaboradorNome FROM execucoes_etapa ex
+       JOIN colaboradores col ON col.id = ex.colaborador_id
+       WHERE ex.item_pedido_id = ANY($1::int[])`,
+      [itemIds]
     );
 
     const calcularExecucao = (exec) => {
@@ -955,6 +957,16 @@ app.get('/ordens-producao', async (req, res) => {
       return { id: exec.id, status: exec.status, tempoAcumulado: base };
     };
 
+    const calcularExecucaoAtual = (exec) => {
+      if (!exec) return null;
+      const base = Math.round(Number(exec.tempoacumulado) || 0);
+      const comum = { id: exec.id, status: exec.status, colaboradorId: exec.colaborador_id, colaboradorNome: exec.colaboradornome };
+      if (exec.status === 'em_andamento') {
+        return { ...comum, tempoAcumuladoBase: base, referenciaInicio: exec.datapausada || exec.inicio };
+      }
+      return { ...comum, tempoAcumulado: base };
+    };
+
     const resultado = pedidos.map((pedido) => ({
       id: pedido.id,
       empresa: pedido.empresa,
@@ -969,9 +981,11 @@ app.get('/ordens-producao', async (req, res) => {
           etapas: etapas
             .filter((e) => e.chicote_id === item.chicote_id)
             .map((e) => {
-              const execucao = execucoes
+              const execucoesDaEtapa = execucoes
                 .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
-                .sort((a, b) => b.id - a.id)[0];
+                .sort((a, b) => b.id - a.id);
+              const minhaExecucao = execucoesDaEtapa.find((ex) => ex.colaborador_id === colaboradorId);
+              const execucaoMaisRecente = execucoesDaEtapa[0];
               return {
                 id: e.id,
                 ordem: e.ordem,
@@ -979,7 +993,8 @@ app.get('/ordens-producao', async (req, res) => {
                 setor: e.setor,
                 quemTexto: e.quemtexto,
                 instrucoes: e.instrucoes,
-                minhaExecucao: calcularExecucao(execucao),
+                minhaExecucao: calcularExecucao(minhaExecucao),
+                execucaoAtual: calcularExecucaoAtual(execucaoMaisRecente),
               };
             }),
         })),
@@ -1004,6 +1019,18 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
     );
     if (emAndamento) {
       return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de iniciar essa.' });
+    }
+
+    const jaExecutada = await db.get(
+      `SELECT ex.status, col.nome AS colaboradorNome FROM execucoes_etapa ex
+       JOIN colaboradores col ON col.id = ex.colaborador_id
+       WHERE ex.item_pedido_id = $1 AND ex.etapa_chicote_id = $2 AND ex.colaborador_id != $3
+       ORDER BY ex.id DESC LIMIT 1`,
+      [itemPedidoId, etapaChicoteId, colaboradorId]
+    );
+    if (jaExecutada) {
+      const acao = jaExecutada.status === 'concluido' ? 'concluída' : jaExecutada.status === 'pausado' ? 'pausada' : 'iniciada';
+      return res.status(409).json({ message: `Essa etapa já foi ${acao} por ${jaExecutada.colaboradornome}.` });
     }
 
     const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
