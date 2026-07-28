@@ -431,7 +431,8 @@ app.get('/pedidos', async (req, res) => {
           ...item,
           codigoDesenho: item.codigodesenho,
           quantidadePedido: item.quantidadepedido,
-          quantidadeEntregue: item.quantidadeentregue
+          quantidadeEntregue: item.quantidadeentregue,
+          chicoteId: item.chicote_id,
         }))
       };
     });
@@ -582,18 +583,112 @@ app.post('/chicotes/import/confirm', async (req, res) => {
   res.json({ resultados });
 });
 
+app.get('/chicotes/clientes', async (req, res) => {
+  try {
+    const rows = await db.all('SELECT cliente, COUNT(*)::int AS total FROM chicotes GROUP BY cliente ORDER BY cliente');
+    res.json(rows.map((r) => ({ cliente: r.cliente, total: r.total })));
+  } catch (error) {
+    console.error('Erro ao listar clientes de chicotes:', error.message);
+    res.status(500).json({ message: 'Erro ao listar clientes de chicotes', error: error.message });
+  }
+});
+
 app.get('/chicotes', async (req, res) => {
   try {
-    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente, codigoDca FROM chicotes ORDER BY cliente, codigoItemCliente');
+    const { cliente } = req.query;
+    const params = [];
+    let where = '';
+    if (cliente) {
+      params.push(cliente);
+      where = 'WHERE cliente = $1';
+    }
+    const chicotes = await db.all(
+      `SELECT id, cliente, codigoItemCliente, codigoDca, tempoIdeal FROM chicotes ${where} ORDER BY cliente, codigoItemCliente`,
+      params
+    );
+    const etapaCounts = await db.all('SELECT chicote_id, COUNT(*)::int AS total FROM etapas_chicote GROUP BY chicote_id');
+    const etapaCountMap = new Map(etapaCounts.map((e) => [e.chicote_id, e.total]));
     res.json(chicotes.map((c) => ({
       id: c.id,
       cliente: c.cliente,
       codigoItemCliente: c.codigoitemcliente,
       codigoDca: c.codigodca,
+      tempoIdeal: c.tempoideal,
+      temEtapas: (etapaCountMap.get(c.id) || 0) > 0,
     })));
   } catch (error) {
     console.error('Erro ao listar chicotes:', error.message);
     res.status(500).json({ message: 'Erro ao listar chicotes', error: error.message });
+  }
+});
+
+app.get('/chicotes/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const chicote = await db.get('SELECT id, cliente, codigoItemCliente, codigoDca, tempoIdeal FROM chicotes WHERE id = $1', [id]);
+    if (!chicote) {
+      return res.status(404).json({ message: 'Chicote não encontrado' });
+    }
+    const etapas = await db.all(
+      'SELECT id, ordem, nome, setor, quemTexto, instrucoes, tempoIdeal FROM etapas_chicote WHERE chicote_id = $1 ORDER BY ordem',
+      [id]
+    );
+    const itensVinculados = await db.all(
+      `SELECT ip.id, ip.codigoDesenho, p.empresa, p.numeroOS, p.status
+       FROM itens_pedidos ip
+       JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ip.chicote_id = $1
+       ORDER BY p.empresa, p.numeroOS`,
+      [id]
+    );
+    res.json({
+      id: chicote.id,
+      cliente: chicote.cliente,
+      codigoItemCliente: chicote.codigoitemcliente,
+      codigoDca: chicote.codigodca,
+      tempoIdeal: chicote.tempoideal,
+      etapas: etapas.map((e) => ({
+        id: e.id,
+        ordem: e.ordem,
+        nome: e.nome,
+        setor: e.setor,
+        quemTexto: e.quemtexto,
+        instrucoes: e.instrucoes,
+        tempoIdeal: e.tempoideal,
+      })),
+      itensVinculados: itensVinculados.map((i) => ({
+        id: i.id,
+        codigoDesenho: i.codigodesenho,
+        empresa: i.empresa,
+        numeroOS: i.numeroos,
+        status: i.status,
+      })),
+    });
+  } catch (error) {
+    console.error('Erro ao buscar chicote:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar chicote', error: error.message });
+  }
+});
+
+app.put('/chicotes/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { codigoItemCliente, codigoDca, tempoIdeal } = req.body;
+  if (!codigoItemCliente || !codigoItemCliente.trim()) {
+    return res.status(400).json({ message: 'Código do item cliente é obrigatório.' });
+  }
+  try {
+    const agora = formatDateToLocalISO(new Date(), 'editar-chicote');
+    const result = await db.run(
+      'UPDATE chicotes SET codigoItemCliente = $1, codigoDca = $2, tempoIdeal = $3, atualizadoEm = $4 WHERE id = $5',
+      [codigoItemCliente, codigoDca || null, tempoIdeal === '' || tempoIdeal === undefined ? null : tempoIdeal, agora, id]
+    );
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Chicote não encontrado' });
+    }
+    res.json({ id, codigoItemCliente, codigoDca: codigoDca || null, tempoIdeal: tempoIdeal ?? null });
+  } catch (error) {
+    console.error('Erro ao editar chicote:', error.message);
+    res.status(500).json({ message: 'Erro ao editar chicote', error: error.message });
   }
 });
 
@@ -898,6 +993,149 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
   }
 });
 
+app.put('/execucoes-etapa/:id/zerar', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    await db.run('DELETE FROM execucoes_etapa WHERE id = $1', [id]);
+    res.json({ id, removida: true });
+  } catch (error) {
+    console.error('Erro ao zerar tempo da execução:', error.message);
+    res.status(500).json({ message: 'Erro ao zerar tempo da execução', error: error.message });
+  }
+});
+
+app.get('/execucoes-etapa/ativas', async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT ex.id, ex.tempoAcumulado, ex.inicio, ex.dataPausada,
+             p.empresa, p.numeroOS,
+             ip.codigoDesenho,
+             ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
+             col.nome AS colaboradorNome
+      FROM execucoes_etapa ex
+      JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
+      JOIN pedidos p ON p.id = ip.pedido_id
+      JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
+      JOIN colaboradores col ON col.id = ex.colaborador_id
+      WHERE ex.status = 'em_andamento'
+      ORDER BY ex.inicio ASC
+    `);
+    const resultado = rows.map((r) => ({
+      id: r.id,
+      empresa: r.empresa,
+      numeroOS: r.numeroos,
+      codigoDesenho: r.codigodesenho,
+      etapaNome: r.etapanome,
+      etapaOrdem: r.etapaordem,
+      colaboradorNome: r.colaboradornome,
+      tempoAcumuladoBase: Math.round(Number(r.tempoacumulado) || 0),
+      referenciaInicio: r.datapausada || r.inicio,
+    }));
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar execuções ativas:', error.message);
+    res.status(500).json({ message: 'Erro ao listar execuções ativas', error: error.message });
+  }
+});
+
+app.get('/ordens-producao/monitor', async (req, res) => {
+  try {
+    const pedidos = await db.all(`
+      SELECT id, empresa, numeroOS, status, ordemPrioridade
+      FROM pedidos
+      WHERE prioritario = 1 AND status IN ('novo', 'andamento')
+      ORDER BY ordemPrioridade ASC NULLS LAST, empresa, numeroOS
+    `);
+
+    if (pedidos.length === 0) {
+      return res.json([]);
+    }
+
+    const pedidoIds = pedidos.map((p) => p.id);
+    const itens = await db.all(
+      'SELECT id, pedido_id, codigoDesenho, chicote_id FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND chicote_id IS NOT NULL',
+      [pedidoIds]
+    );
+
+    if (itens.length === 0) {
+      return res.json(pedidos.map((p) => ({
+        id: p.id,
+        empresa: p.empresa,
+        numeroOS: p.numeroos,
+        status: p.status,
+        ordemPrioridade: p.ordemprioridade,
+        itens: [],
+      })));
+    }
+
+    const chicoteIds = [...new Set(itens.map((i) => i.chicote_id))];
+    const itemIds = itens.map((i) => i.id);
+
+    const etapas = await db.all(
+      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+      [chicoteIds]
+    );
+    const execucoes = await db.all(
+      `SELECT ex.*, col.nome AS colaboradorNome FROM execucoes_etapa ex
+       JOIN colaboradores col ON col.id = ex.colaborador_id
+       WHERE ex.item_pedido_id = ANY($1::int[])`,
+      [itemIds]
+    );
+
+    const calcularExecucao = (exec) => {
+      if (!exec) return null;
+      const base = Math.round(Number(exec.tempoacumulado) || 0);
+      if (exec.status === 'em_andamento') {
+        return {
+          id: exec.id,
+          status: exec.status,
+          colaboradorNome: exec.colaboradornome,
+          tempoAcumuladoBase: base,
+          referenciaInicio: exec.datapausada || exec.inicio,
+        };
+      }
+      return { id: exec.id, status: exec.status, colaboradorNome: exec.colaboradornome, tempoAcumulado: base };
+    };
+
+    const resultado = pedidos.map((pedido) => ({
+      id: pedido.id,
+      empresa: pedido.empresa,
+      numeroOS: pedido.numeroos,
+      status: pedido.status,
+      ordemPrioridade: pedido.ordemprioridade,
+      itens: itens
+        .filter((item) => item.pedido_id === pedido.id)
+        .map((item) => ({
+          id: item.id,
+          codigoDesenho: item.codigodesenho,
+          etapas: etapas
+            .filter((e) => e.chicote_id === item.chicote_id)
+            .map((e) => {
+              const execucao = execucoes
+                .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
+                .sort((a, b) => b.id - a.id)[0];
+              return {
+                id: e.id,
+                ordem: e.ordem,
+                nome: e.nome,
+                setor: e.setor,
+                quemTexto: e.quemtexto,
+                instrucoes: e.instrucoes,
+                execucao: calcularExecucao(execucao),
+              };
+            }),
+        })),
+    }));
+
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar monitor de produção:', error.message);
+    res.status(500).json({ message: 'Erro ao listar monitor de produção', error: error.message });
+  }
+});
+
 app.get('/historico-entregas/:pedidoId', async (req, res) => {
   const pedidoId = parseInt(req.params.pedidoId);
   try {
@@ -1196,13 +1434,13 @@ app.put('/pedidos/:id', async (req, res) => {
 
       const itemSql = `
         UPDATE itens_pedidos
-        SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3
-        WHERE pedido_id = $4 AND id = $5
+        SET codigoDesenho = $1, quantidadePedido = $2, quantidadeEntregue = $3, chicote_id = $4
+        WHERE pedido_id = $5 AND id = $6
         RETURNING *
       `;
       const insertItemSql = `
-        INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue, chicote_id)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
       `;
       const historicoSql = `
@@ -1212,18 +1450,21 @@ app.put('/pedidos/:id', async (req, res) => {
       `;
 
       for (const item of itens) {
-        const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
+        const { id: itemId, codigoDesenho, quantidadePedido, quantidadeEntregue, chicoteId } = item;
         let updatedItem;
         const itemExistente = itensExistentesMap.get(codigoDesenho);
         if (itemExistente) {
           const quantidadeEntregueAnterior = itemExistente.quantidadeentregue || 0;
           const novaQuantidadeEntregue = parseInt(quantidadeEntregue || 0, 10);
           const quantidadeAdicionada = novaQuantidadeEntregue - quantidadeEntregueAnterior;
+          // Se o formulário não mandar chicoteId (undefined), preserva o vínculo que já existia
+          const chicoteIdFinal = chicoteId !== undefined ? (chicoteId || null) : itemExistente.chicote_id;
 
           const itemResult = await client.query(itemSql, [
             codigoDesenho,
             quantidadePedido,
             novaQuantidadeEntregue,
+            chicoteIdFinal,
             id,
             itemExistente.id
           ]);
@@ -1243,7 +1484,8 @@ app.put('/pedidos/:id', async (req, res) => {
             id,
             codigoDesenho,
             quantidadePedido,
-            quantidadeEntregue || 0
+            quantidadeEntregue || 0,
+            chicoteId || null
           ]);
           updatedItem = itemResult.rows[0];
 
@@ -1355,8 +1597,8 @@ app.post('/pedidos', async (req, res) => {
     }
 
     const itemSql = `
-      INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO itens_pedidos (pedido_id, codigoDesenho, quantidadePedido, quantidadeEntregue, chicote_id)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING id
     `;
     const historicoSql = `
@@ -1366,8 +1608,8 @@ app.post('/pedidos', async (req, res) => {
     `;
 
     for (const item of itens) {
-      const { codigoDesenho, quantidadePedido, quantidadeEntregue } = item;
-      const itemResult = await client.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0]);
+      const { codigoDesenho, quantidadePedido, quantidadeEntregue, chicoteId } = item;
+      const itemResult = await client.query(itemSql, [pedidoId, codigoDesenho, quantidadePedido, quantidadeEntregue || 0, chicoteId || null]);
       if (!itemResult.rows || itemResult.rows.length === 0) {
         throw new Error('Falha ao inserir item: Nenhum ID retornado');
       }
