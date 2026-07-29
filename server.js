@@ -692,6 +692,125 @@ app.put('/chicotes/:id', async (req, res) => {
   }
 });
 
+app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
+  const chicoteId = parseInt(req.params.id);
+  try {
+    const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
+    if (!chicote) {
+      return res.status(404).json({ message: 'Chicote não encontrado' });
+    }
+
+    const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+    if (etapas.length === 0) {
+      return res.status(400).json({ message: 'Esse chicote não tem etapas cadastradas.' });
+    }
+    const etapaIds = etapas.map((e) => e.id);
+
+    const itens = await db.all(
+      'SELECT id, pedido_id, quantidadePedido FROM itens_pedidos WHERE chicote_id = $1',
+      [chicoteId]
+    );
+    if (itens.length === 0) {
+      return res.status(400).json({ message: 'Nenhum item de pedido vinculado a esse chicote ainda.' });
+    }
+    const itemIds = itens.map((i) => i.id);
+    const itemMap = new Map(itens.map((i) => [i.id, i]));
+
+    const execucoes = await db.all(
+      `SELECT item_pedido_id, etapa_chicote_id, tempoAcumulado, dataConclusao
+       FROM execucoes_etapa
+       WHERE item_pedido_id = ANY($1::int[]) AND etapa_chicote_id = ANY($2::int[]) AND status = 'concluido'`,
+      [itemIds, etapaIds]
+    );
+
+    const porItem = new Map();
+    execucoes.forEach((ex) => {
+      if (!porItem.has(ex.item_pedido_id)) porItem.set(ex.item_pedido_id, new Map());
+      const mapaEtapas = porItem.get(ex.item_pedido_id);
+      const existente = mapaEtapas.get(ex.etapa_chicote_id);
+      if (!existente || new Date(ex.dataconclusao) > new Date(existente.dataconclusao)) {
+        mapaEtapas.set(ex.etapa_chicote_id, ex);
+      }
+    });
+
+    const candidatosPorPedido = new Map();
+    porItem.forEach((mapaEtapas, itemPedidoId) => {
+      const completo = etapaIds.every((eid) => mapaEtapas.has(eid));
+      if (!completo) return;
+      const item = itemMap.get(itemPedidoId);
+      const conclusaoMaisRecente = Math.max(...Array.from(mapaEtapas.values()).map((ex) => new Date(ex.dataconclusao).getTime()));
+      const candidato = {
+        itemPedidoId,
+        pedidoId: item.pedido_id,
+        quantidadePedido: item.quantidadepedido,
+        conclusaoMaisRecente,
+        etapaTempos: mapaEtapas,
+      };
+      const existente = candidatosPorPedido.get(item.pedido_id);
+      if (!existente || candidato.conclusaoMaisRecente > existente.conclusaoMaisRecente) {
+        candidatosPorPedido.set(item.pedido_id, candidato);
+      }
+    });
+
+    const candidatosOrdenados = Array.from(candidatosPorPedido.values())
+      .sort((a, b) => b.conclusaoMaisRecente - a.conclusaoMaisRecente);
+
+    const validos = [];
+    for (const candidato of candidatosOrdenados) {
+      if (validos.length >= 5) break;
+      const qtd = Number(candidato.quantidadePedido);
+      if (!qtd || qtd <= 0 || isNaN(qtd)) continue;
+      validos.push(candidato);
+    }
+
+    if (validos.length === 0) {
+      return res.status(400).json({ message: 'Não há execuções concluídas suficientes desse chicote para calcular a média.' });
+    }
+
+    let somaTotalPorUnidade = 0;
+    const somaEtapaPorUnidade = new Map(etapaIds.map((eid) => [eid, 0]));
+
+    validos.forEach((candidato) => {
+      const qtd = Number(candidato.quantidadePedido);
+      let totalSegundos = 0;
+      etapaIds.forEach((eid) => {
+        const tempoEtapa = Number(candidato.etapaTempos.get(eid).tempoacumulado) || 0;
+        totalSegundos += tempoEtapa;
+        somaEtapaPorUnidade.set(eid, somaEtapaPorUnidade.get(eid) + tempoEtapa / qtd);
+      });
+      somaTotalPorUnidade += totalSegundos / qtd;
+    });
+
+    const paraMinutos = (segundos) => Math.round((segundos / 60) * 10) / 10;
+    const mediaTotalMin = paraMinutos(somaTotalPorUnidade / validos.length);
+    const mediasEtapas = etapaIds.map((eid) => ({
+      id: eid,
+      tempoIdeal: paraMinutos(somaEtapaPorUnidade.get(eid) / validos.length),
+    }));
+
+    const agora = formatDateToLocalISO(new Date(), 'media-tempos-chicote');
+    await db.run('UPDATE chicotes SET tempoIdeal = $1, atualizadoEm = $2 WHERE id = $3', [mediaTotalMin, agora, chicoteId]);
+    for (const m of mediasEtapas) {
+      await db.run('UPDATE etapas_chicote SET tempoIdeal = $1 WHERE id = $2', [m.tempoIdeal, m.id]);
+    }
+
+    const pedidosUsados = await db.all(
+      'SELECT id, empresa, numeroOS FROM pedidos WHERE id = ANY($1::int[])',
+      [validos.map((v) => v.pedidoId)]
+    );
+
+    res.json({
+      tempoIdeal: mediaTotalMin,
+      etapas: mediasEtapas,
+      execucoesUsadas: validos.length,
+      pedidos: pedidosUsados.map((p) => ({ empresa: p.empresa, numeroOS: p.numeroos })),
+    });
+  } catch (error) {
+    console.error('Erro ao calcular média de tempos do chicote:', error.message);
+    res.status(500).json({ message: 'Erro ao calcular média de tempos do chicote', error: error.message });
+  }
+});
+
 app.post('/chicotes/:id/etapas', async (req, res) => {
   const chicoteId = parseInt(req.params.id);
   const { nome, setor, quemTexto, instrucoes, tempoIdeal } = req.body;
