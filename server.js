@@ -700,12 +700,11 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
       return res.status(404).json({ message: 'Chicote não encontrado' });
     }
 
-    const etapas = await db.all('SELECT id, colaboradores FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+    const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
     if (etapas.length === 0) {
       return res.status(400).json({ message: 'Esse chicote não tem etapas cadastradas.' });
     }
     const etapaIds = etapas.map((e) => e.id);
-    const etapaColaboradoresMap = new Map(etapas.map((e) => [e.id, Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1]));
 
     const itens = await db.all(
       'SELECT id, pedido_id, quantidadePedido FROM itens_pedidos WHERE chicote_id = $1',
@@ -718,20 +717,23 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
     const itemMap = new Map(itens.map((i) => [i.id, i]));
 
     const execucoes = await db.all(
-      `SELECT item_pedido_id, etapa_chicote_id, tempoAcumulado, dataConclusao
+      `SELECT item_pedido_id, etapa_chicote_id, colaborador_id, tempoAcumulado, dataConclusao
        FROM execucoes_etapa
        WHERE item_pedido_id = ANY($1::int[]) AND etapa_chicote_id = ANY($2::int[]) AND status = 'concluido'`,
       [itemIds, etapaIds]
     );
 
+    // Tempo de uma etapa = média entre os colaboradores que a executaram
+    // (cada um registra seu próprio tempo; com 1 só colaborador, a "média" é o próprio tempo dele).
+    const tempoMedioEtapa = (execsDaEtapa) =>
+      execsDaEtapa.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / execsDaEtapa.length;
+
     const porItem = new Map();
     execucoes.forEach((ex) => {
       if (!porItem.has(ex.item_pedido_id)) porItem.set(ex.item_pedido_id, new Map());
       const mapaEtapas = porItem.get(ex.item_pedido_id);
-      const existente = mapaEtapas.get(ex.etapa_chicote_id);
-      if (!existente || new Date(ex.dataconclusao) > new Date(existente.dataconclusao)) {
-        mapaEtapas.set(ex.etapa_chicote_id, ex);
-      }
+      if (!mapaEtapas.has(ex.etapa_chicote_id)) mapaEtapas.set(ex.etapa_chicote_id, []);
+      mapaEtapas.get(ex.etapa_chicote_id).push(ex);
     });
 
     const candidatosPorPedido = new Map();
@@ -739,7 +741,8 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
       const completo = etapaIds.every((eid) => mapaEtapas.has(eid));
       if (!completo) return;
       const item = itemMap.get(itemPedidoId);
-      const conclusaoMaisRecente = Math.max(...Array.from(mapaEtapas.values()).map((ex) => new Date(ex.dataconclusao).getTime()));
+      const todasExecucoes = Array.from(mapaEtapas.values()).flat();
+      const conclusaoMaisRecente = Math.max(...todasExecucoes.map((ex) => new Date(ex.dataconclusao).getTime()));
       const candidato = {
         itemPedidoId,
         pedidoId: item.pedido_id,
@@ -775,8 +778,7 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
       const qtd = Number(candidato.quantidadePedido);
       let totalSegundos = 0;
       etapaIds.forEach((eid) => {
-        const tempoEtapaBruto = Number(candidato.etapaTempos.get(eid).tempoacumulado) || 0;
-        const tempoEtapa = tempoEtapaBruto * etapaColaboradoresMap.get(eid);
+        const tempoEtapa = tempoMedioEtapa(candidato.etapaTempos.get(eid));
         totalSegundos += tempoEtapa;
         somaEtapaPorUnidade.set(eid, somaEtapaPorUnidade.get(eid) + tempoEtapa / qtd);
       });
@@ -1111,6 +1113,15 @@ app.get('/ordens-producao', async (req, res) => {
                 .sort((a, b) => b.id - a.id);
               const minhaExecucao = execucoesDaEtapa.find((ex) => ex.colaborador_id === colaboradorId);
               const execucaoMaisRecente = execucoesDaEtapa[0];
+              const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
+              // Tempo da etapa = média entre os colaboradores que a concluíram
+              // (cada um registra seu próprio tempo; com 1 só, a "média" é o tempo dele mesmo).
+              const tempoMedioConcluido = concluidas.length > 0
+                ? concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length
+                : null;
+              // Todas as execuções da etapa (qualquer colaborador, qualquer status), pra mostrar
+              // todo mundo que trabalhou/está trabalhando na mesma etapa, não só a mais recente.
+              const execucoesEtapa = execucoesDaEtapa.map((ex) => calcularExecucaoAtual(ex));
               return {
                 id: e.id,
                 ordem: e.ordem,
@@ -1121,15 +1132,15 @@ app.get('/ordens-producao', async (req, res) => {
                 instrucoes: e.instrucoes,
                 minhaExecucao: calcularExecucao(minhaExecucao),
                 execucaoAtual: calcularExecucaoAtual(execucaoMaisRecente),
+                execucoes: execucoesEtapa,
+                concluida: concluidas.length > 0,
+                tempoMedioConcluido,
               };
             });
-          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.execucaoAtual?.status === 'concluido');
+          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.tempoMedioConcluido !== null);
           const qtd = Number(item.quantidadepedido);
           const tempoTotalReal = todasConcluidas && qtd > 0
-            ? Math.round(etapasDoItem.reduce((soma, e) => {
-                const colaboradoresEtapa = Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1;
-                return soma + (e.execucaoAtual?.tempoAcumulado || 0) * colaboradoresEtapa;
-              }, 0) / qtd)
+            ? Math.round(etapasDoItem.reduce((soma, e) => soma + e.tempoMedioConcluido, 0) / qtd)
             : null;
           return {
             id: item.id,
@@ -1137,7 +1148,7 @@ app.get('/ordens-producao', async (req, res) => {
             quantidadePedido: item.quantidadepedido,
             tempoIdeal: chicoteTempoIdealMap.get(item.chicote_id) ?? null,
             tempoTotalReal,
-            etapas: etapasDoItem,
+            etapas: etapasDoItem.map(({ tempoMedioConcluido, ...resto }) => resto),
           };
         }),
     }));
@@ -1163,17 +1174,9 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de iniciar essa.' });
     }
 
-    const jaExecutada = await db.get(
-      `SELECT ex.status, col.nome AS colaboradorNome FROM execucoes_etapa ex
-       JOIN colaboradores col ON col.id = ex.colaborador_id
-       WHERE ex.item_pedido_id = $1 AND ex.etapa_chicote_id = $2 AND ex.colaborador_id != $3
-       ORDER BY ex.id DESC LIMIT 1`,
-      [itemPedidoId, etapaChicoteId, colaboradorId]
-    );
-    if (jaExecutada) {
-      const acao = jaExecutada.status === 'concluido' ? 'concluída' : jaExecutada.status === 'pausado' ? 'pausada' : 'iniciada';
-      return res.status(409).json({ message: `Essa etapa já foi ${acao} por ${jaExecutada.colaboradornome}.` });
-    }
+    // Vários colaboradores podem executar a mesma etapa ao mesmo tempo, cada um
+    // registrando seu próprio tempo (o tempo da etapa vira a média entre eles).
+    // Não há mais bloqueio por causa de outro colaborador já estar/ter estado nessa etapa.
 
     const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
     const execucao = await db.get(
@@ -1417,9 +1420,18 @@ app.get('/ordens-producao/monitor', async (req, res) => {
           const etapasDoItem = etapas
             .filter((e) => e.chicote_id === item.chicote_id)
             .map((e) => {
-              const execucao = execucoes
+              const execucoesDaEtapa = execucoes
                 .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
-                .sort((a, b) => b.id - a.id)[0];
+                .sort((a, b) => b.id - a.id);
+              const execucaoMaisRecente = execucoesDaEtapa[0];
+              const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
+              // Tempo da etapa = média entre os colaboradores que a concluíram.
+              const tempoMedioConcluido = concluidas.length > 0
+                ? concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length
+                : null;
+              // Todas as execuções da etapa (qualquer colaborador, qualquer status), pra mostrar
+              // todo mundo que trabalhou/está trabalhando na mesma etapa, não só a mais recente.
+              const execucoesEtapa = execucoesDaEtapa.map((ex) => calcularExecucao(ex));
               return {
                 id: e.id,
                 ordem: e.ordem,
@@ -1428,17 +1440,18 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 quemTexto: e.quemtexto,
                 colaboradores: e.colaboradores,
                 instrucoes: e.instrucoes,
-                execucao: calcularExecucao(execucao),
+                execucao: calcularExecucao(execucaoMaisRecente),
+                execucoes: execucoesEtapa,
+                concluida: concluidas.length > 0,
+                tempoMedioConcluido,
               };
             });
-          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.execucao?.status === 'concluido');
+          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.tempoMedioConcluido !== null);
           const qtd = Number(item.quantidadepedido);
           const tempoTotalReal = todasConcluidas && qtd > 0
-            ? Math.round(etapasDoItem.reduce((soma, e) => {
-                const colaboradoresEtapa = Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1;
-                return soma + (e.execucao?.tempoAcumulado || 0) * colaboradoresEtapa;
-              }, 0) / qtd)
+            ? Math.round(etapasDoItem.reduce((soma, e) => soma + e.tempoMedioConcluido, 0) / qtd)
             : null;
+          etapasDoItem.forEach((e) => delete e.tempoMedioConcluido);
           return {
             id: item.id,
             codigoDesenho: item.codigodesenho,
