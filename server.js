@@ -1058,7 +1058,43 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
 
     const item = await db.get('SELECT pedido_id FROM itens_pedidos WHERE id = $1', [itemPedidoId]);
     if (item) {
-      await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
+      const resultadoStatus = await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
+      if (resultadoStatus.changes > 0) {
+        try {
+          const pedido = await db.get('SELECT * FROM pedidos WHERE id = $1', [item.pedido_id]);
+          const itensDoPedido = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [item.pedido_id]);
+          const pedidoFormatado = {
+            empresa: pedido.empresa,
+            numeroOS: pedido.numeroos,
+            dataEntrada: pedido.dataentrada,
+            previsaoEntrega: pedido.previsaoentrega,
+            responsavel: pedido.responsavel,
+            status: pedido.status,
+            inicio: converterFormatoData(pedido.inicio),
+            tempo: 0,
+            pausado: false,
+            tempoPausado: 0,
+          };
+          const itensFormatados = itensDoPedido.map((i) => ({
+            codigoDesenho: i.codigodesenho,
+            quantidadePedido: i.quantidadepedido,
+            quantidadeEntregue: i.quantidadeentregue,
+          }));
+          const emailText = montarEmail(pedidoFormatado, itensFormatados, 'Pedido movido para Em Andamento — colaborador iniciou a produção.', []);
+          const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
+          const destinatarios = rawEmailTo.split(',').map((e) => e.trim()).filter((e) => e.length > 0 && e.includes('@'));
+          for (const destinatario of destinatarios) {
+            await transporter.sendMail({
+              from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
+              to: destinatario,
+              subject: `Atualização de Pedido ${pedidoFormatado.numeroOS} - Status: andamento`,
+              text: emailText,
+            });
+          }
+        } catch (emailError) {
+          console.error('Erro ao enviar e-mail de início de produção:', emailError.message);
+        }
+      }
     }
 
     res.status(201).json({ id: execucao.id, status: 'em_andamento', tempoAcumuladoBase: 0, referenciaInicio: agora });
