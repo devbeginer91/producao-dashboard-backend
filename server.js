@@ -1177,7 +1177,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
 
     const pedidoIds = pedidos.map((p) => p.id);
     const itens = await db.all(
-      'SELECT id, pedido_id, codigoDesenho, chicote_id FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND chicote_id IS NOT NULL',
+      'SELECT id, pedido_id, codigoDesenho, quantidadePedido, chicote_id FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND chicote_id IS NOT NULL',
       [pedidoIds]
     );
 
@@ -1194,6 +1194,12 @@ app.get('/ordens-producao/monitor', async (req, res) => {
 
     const chicoteIds = [...new Set(itens.map((i) => i.chicote_id))];
     const itemIds = itens.map((i) => i.id);
+
+    const chicotes = await db.all(
+      'SELECT id, tempoIdeal FROM chicotes WHERE id = ANY($1::int[])',
+      [chicoteIds]
+    );
+    const chicoteTempoIdealMap = new Map(chicotes.map((c) => [c.id, c.tempoideal]));
 
     const etapas = await db.all(
       'SELECT id, chicote_id, ordem, nome, setor, quemTexto, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
@@ -1229,10 +1235,8 @@ app.get('/ordens-producao/monitor', async (req, res) => {
       ordemPrioridade: pedido.ordemprioridade,
       itens: itens
         .filter((item) => item.pedido_id === pedido.id)
-        .map((item) => ({
-          id: item.id,
-          codigoDesenho: item.codigodesenho,
-          etapas: etapas
+        .map((item) => {
+          const etapasDoItem = etapas
             .filter((e) => e.chicote_id === item.chicote_id)
             .map((e) => {
               const execucao = execucoes
@@ -1247,8 +1251,20 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 instrucoes: e.instrucoes,
                 execucao: calcularExecucao(execucao),
               };
-            }),
-        })),
+            });
+          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.execucao?.status === 'concluido');
+          const tempoTotalReal = todasConcluidas
+            ? etapasDoItem.reduce((soma, e) => soma + (e.execucao?.tempoAcumulado || 0), 0)
+            : null;
+          return {
+            id: item.id,
+            codigoDesenho: item.codigodesenho,
+            quantidadePedido: item.quantidadepedido,
+            tempoIdeal: chicoteTempoIdealMap.get(item.chicote_id) ?? null,
+            tempoTotalReal,
+            etapas: etapasDoItem,
+          };
+        }),
     }));
 
     res.json(resultado);
