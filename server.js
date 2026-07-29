@@ -399,6 +399,54 @@ app.get('/pedidos', async (req, res) => {
     const itens = await db.all('SELECT * FROM itens_pedidos');
     const obsCounts = await db.all('SELECT pedido_id, COUNT(*)::int AS count FROM historico_observacoes GROUP BY pedido_id');
     const obsCountMap = new Map(obsCounts.map(o => [o.pedido_id, o.count]));
+
+    const chicoteIds = [...new Set(itens.filter((i) => i.chicote_id).map((i) => i.chicote_id))];
+    const itemIdsComChicote = itens.filter((i) => i.chicote_id).map((i) => i.id);
+    const producaoPorItem = new Map();
+    if (itemIdsComChicote.length > 0) {
+      const etapasChicotes = await db.all(
+        'SELECT id, chicote_id, ordem, nome FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+        [chicoteIds]
+      );
+      const execucoesItens = await db.all(
+        `SELECT ex.*, col.nome AS colaboradorNome FROM execucoes_etapa ex
+         JOIN colaboradores col ON col.id = ex.colaborador_id
+         WHERE ex.item_pedido_id = ANY($1::int[])`,
+        [itemIdsComChicote]
+      );
+      itens.filter((i) => i.chicote_id).forEach((item) => {
+        const etapasDoItem = etapasChicotes.filter((e) => e.chicote_id === item.chicote_id);
+        const execucoesDoItem = execucoesItens.filter((ex) => ex.item_pedido_id === item.id);
+        const temExecucaoAtiva = execucoesDoItem.some((ex) => ex.status !== 'concluido');
+        const etapasConcluidas = [];
+        let todasConcluidas = etapasDoItem.length > 0;
+        let somaTempoMedio = 0;
+        etapasDoItem.forEach((e) => {
+          const execucoesDaEtapa = execucoesDoItem.filter((ex) => ex.etapa_chicote_id === e.id);
+          const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
+          if (concluidas.length === 0) {
+            todasConcluidas = false;
+            return;
+          }
+          const tempoMedio = concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length;
+          somaTempoMedio += tempoMedio;
+          etapasConcluidas.push({
+            nome: e.nome,
+            tempoSegundos: Math.round(tempoMedio),
+            colaboradores: [...new Set(concluidas.map((ex) => ex.colaboradornome))],
+          });
+        });
+        const qtd = Number(item.quantidadepedido);
+        const tempoTotalReal = todasConcluidas && qtd > 0 ? Math.round(somaTempoMedio / qtd) : null;
+        producaoPorItem.set(item.id, {
+          totalEtapas: etapasDoItem.length,
+          etapasConcluidas,
+          temExecucaoAtiva,
+          tempoTotalReal,
+        });
+      });
+    }
+
     const pedidosComItens = pedidos.map(pedido => {
       const tempoPausado = Number(pedido.tempopausado) || 0;
       let tempoFinal = tempoPausado;
@@ -433,6 +481,7 @@ app.get('/pedidos', async (req, res) => {
           quantidadePedido: item.quantidadepedido,
           quantidadeEntregue: item.quantidadeentregue,
           chicoteId: item.chicote_id,
+          producao: producaoPorItem.get(item.id) || null,
         }))
       };
     });
