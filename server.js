@@ -700,11 +700,12 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
       return res.status(404).json({ message: 'Chicote não encontrado' });
     }
 
-    const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+    const etapas = await db.all('SELECT id, colaboradores FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
     if (etapas.length === 0) {
       return res.status(400).json({ message: 'Esse chicote não tem etapas cadastradas.' });
     }
     const etapaIds = etapas.map((e) => e.id);
+    const etapaColaboradoresMap = new Map(etapas.map((e) => [e.id, Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1]));
 
     const itens = await db.all(
       'SELECT id, pedido_id, quantidadePedido FROM itens_pedidos WHERE chicote_id = $1',
@@ -774,7 +775,8 @@ app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
       const qtd = Number(candidato.quantidadePedido);
       let totalSegundos = 0;
       etapaIds.forEach((eid) => {
-        const tempoEtapa = Number(candidato.etapaTempos.get(eid).tempoacumulado) || 0;
+        const tempoEtapaBruto = Number(candidato.etapaTempos.get(eid).tempoacumulado) || 0;
+        const tempoEtapa = tempoEtapaBruto * etapaColaboradoresMap.get(eid);
         totalSegundos += tempoEtapa;
         somaEtapaPorUnidade.set(eid, somaEtapaPorUnidade.get(eid) + tempoEtapa / qtd);
       });
@@ -1058,7 +1060,7 @@ app.get('/ordens-producao', async (req, res) => {
     const chicoteTempoIdealMap = new Map(chicotes.map((c) => [c.id, c.tempoideal]));
 
     const etapas = await db.all(
-      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, colaboradores, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
       [chicoteIds]
     );
     const execucoes = await db.all(
@@ -1115,14 +1117,19 @@ app.get('/ordens-producao', async (req, res) => {
                 nome: e.nome,
                 setor: e.setor,
                 quemTexto: e.quemtexto,
+                colaboradores: e.colaboradores,
                 instrucoes: e.instrucoes,
                 minhaExecucao: calcularExecucao(minhaExecucao),
                 execucaoAtual: calcularExecucaoAtual(execucaoMaisRecente),
               };
             });
           const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.execucaoAtual?.status === 'concluido');
-          const tempoTotalReal = todasConcluidas
-            ? etapasDoItem.reduce((soma, e) => soma + (e.execucaoAtual?.tempoAcumulado || 0), 0)
+          const qtd = Number(item.quantidadepedido);
+          const tempoTotalReal = todasConcluidas && qtd > 0
+            ? Math.round(etapasDoItem.reduce((soma, e) => {
+                const colaboradoresEtapa = Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1;
+                return soma + (e.execucaoAtual?.tempoAcumulado || 0) * colaboradoresEtapa;
+              }, 0) / qtd)
             : null;
           return {
             id: item.id,
@@ -1373,7 +1380,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
     const chicoteTempoIdealMap = new Map(chicotes.map((c) => [c.id, c.tempoideal]));
 
     const etapas = await db.all(
-      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, colaboradores, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
       [chicoteIds]
     );
     const execucoes = await db.all(
@@ -1419,13 +1426,18 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 nome: e.nome,
                 setor: e.setor,
                 quemTexto: e.quemtexto,
+                colaboradores: e.colaboradores,
                 instrucoes: e.instrucoes,
                 execucao: calcularExecucao(execucao),
               };
             });
           const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.execucao?.status === 'concluido');
-          const tempoTotalReal = todasConcluidas
-            ? etapasDoItem.reduce((soma, e) => soma + (e.execucao?.tempoAcumulado || 0), 0)
+          const qtd = Number(item.quantidadepedido);
+          const tempoTotalReal = todasConcluidas && qtd > 0
+            ? Math.round(etapasDoItem.reduce((soma, e) => {
+                const colaboradoresEtapa = Number(e.colaboradores) > 0 ? Number(e.colaboradores) : 1;
+                return soma + (e.execucao?.tempoAcumulado || 0) * colaboradoresEtapa;
+              }, 0) / qtd)
             : null;
           return {
             id: item.id,
