@@ -264,6 +264,14 @@ const initializeDatabase = async () => {
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS dataFaturamento TEXT`);
 
     await db.run(`
+      CREATE TABLE IF NOT EXISTS financeiro_clientes_ocultos (
+        id SERIAL PRIMARY KEY,
+        empresa TEXT NOT NULL UNIQUE,
+        ocultadoEm TEXT NOT NULL
+      )
+    `);
+
+    await db.run(`
       CREATE TABLE IF NOT EXISTS desenhos_chicote (
         id SERIAL PRIMARY KEY,
         chicote_id INTEGER REFERENCES chicotes(id) ON DELETE SET NULL,
@@ -551,9 +559,12 @@ app.get('/financeiro/resumo', async (req, res) => {
        FROM itens_pedidos ip
        JOIN pedidos p ON p.id = ip.pedido_id`
     );
+    const ocultos = await db.all('SELECT empresa FROM financeiro_clientes_ocultos');
+    const ocultosSet = new Set(ocultos.map((o) => o.empresa));
 
     const porCliente = new Map();
     itens.forEach((item) => {
+      if (ocultosSet.has(item.empresa)) return;
       const valorAberto = item.faturado === 1 || item.valorunitario == null
         ? 0
         : Number(item.quantidadepedido) * Number(item.valorunitario);
@@ -569,6 +580,47 @@ app.get('/financeiro/resumo', async (req, res) => {
   } catch (err) {
     console.error('Erro ao gerar resumo financeiro:', err.message);
     res.status(500).json({ message: 'Erro ao gerar resumo financeiro', error: err.message });
+  }
+});
+
+app.get('/financeiro/clientes-ocultos', async (req, res) => {
+  try {
+    const ocultos = await db.all(
+      'SELECT empresa, ocultadoEm FROM financeiro_clientes_ocultos ORDER BY empresa'
+    );
+    res.json(ocultos.map((o) => ({ empresa: o.empresa, ocultadoEm: o.ocultadoem })));
+  } catch (err) {
+    console.error('Erro ao listar clientes ocultos:', err.message);
+    res.status(500).json({ message: 'Erro ao listar clientes ocultos', error: err.message });
+  }
+});
+
+app.post('/financeiro/clientes-ocultos', async (req, res) => {
+  const { empresa } = req.body;
+  if (!empresa) {
+    return res.status(400).json({ message: 'Empresa é obrigatória.' });
+  }
+  try {
+    const agora = formatDateToLocalISO(new Date(), 'ocultar-cliente-financeiro');
+    await db.run(
+      `INSERT INTO financeiro_clientes_ocultos (empresa, ocultadoEm) VALUES ($1, $2)
+       ON CONFLICT (empresa) DO NOTHING`,
+      [empresa, agora]
+    );
+    res.json({ sucesso: true });
+  } catch (err) {
+    console.error('Erro ao ocultar cliente:', err.message);
+    res.status(500).json({ message: 'Erro ao ocultar cliente', error: err.message });
+  }
+});
+
+app.delete('/financeiro/clientes-ocultos/:empresa', async (req, res) => {
+  try {
+    await db.run('DELETE FROM financeiro_clientes_ocultos WHERE empresa = $1', [req.params.empresa]);
+    res.json({ sucesso: true });
+  } catch (err) {
+    console.error('Erro ao reexibir cliente:', err.message);
+    res.status(500).json({ message: 'Erro ao reexibir cliente', error: err.message });
   }
 });
 
