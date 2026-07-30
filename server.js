@@ -3,12 +3,30 @@ const cors = require('cors');
 const nodemailer = require('nodemailer');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
+const path = require('path');
+const AdmZip = require('adm-zip');
 const { Pool } = require('pg');
 const { parseChicoteWorkbook } = require('./importParser');
 require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const upload = multer({ storage: multer.memoryStorage() });
+const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
+
+const MIME_POR_EXTENSAO = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  dwg: 'application/acad',
+  dxf: 'application/dxf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
 
 const formatDateToLocalISO = (date, context = 'unknown') => {
   const d = date ? new Date(date) : new Date();
@@ -244,6 +262,20 @@ const initializeDatabase = async () => {
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS faturado INTEGER DEFAULT 0`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS valorFaturado FLOAT`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS dataFaturamento TEXT`);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS desenhos_chicote (
+        id SERIAL PRIMARY KEY,
+        chicote_id INTEGER REFERENCES chicotes(id) ON DELETE SET NULL,
+        cliente TEXT NOT NULL,
+        codigoArquivo TEXT NOT NULL,
+        nomeArquivo TEXT NOT NULL,
+        tipoArquivo TEXT,
+        tamanho INTEGER,
+        conteudo BYTEA NOT NULL,
+        criadoEm TEXT NOT NULL
+      )
+    `);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -768,6 +800,181 @@ app.post('/chicotes/import/confirm', async (req, res) => {
   res.json({ resultados });
 });
 
+app.post('/desenhos/importar-zip', uploadZip.single('arquivo'), async (req, res) => {
+  try {
+    const arquivoZip = req.file;
+    if (!arquivoZip) {
+      return res.status(400).json({ message: 'Nenhum arquivo .zip enviado.' });
+    }
+
+    let zip;
+    try {
+      zip = new AdmZip(arquivoZip.buffer);
+    } catch (zipErr) {
+      return res.status(400).json({ message: 'Não foi possível ler o arquivo .zip.', error: zipErr.message });
+    }
+
+    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente FROM chicotes');
+    const chaveChicote = (cliente, codigo) => `${(cliente || '').trim().toLowerCase()}::${(codigo || '').trim().toLowerCase()}`;
+    const chicotesPorChave = new Map(chicotes.map((c) => [chaveChicote(c.cliente, c.codigoitemcliente), c.id]));
+
+    const agora = formatDateToLocalISO(new Date(), 'importar-desenhos');
+    const entradas = zip.getEntries().filter((e) => !e.isDirectory);
+
+    let importados = 0;
+    let vinculados = 0;
+    const arquivosSemVinculo = [];
+    const ignorados = [];
+
+    for (const entrada of entradas) {
+      const partes = entrada.entryName.split('/').filter(Boolean);
+      const nomeArquivo = partes[partes.length - 1];
+
+      if (!nomeArquivo || nomeArquivo.startsWith('.') || partes.some((p) => p.startsWith('__MACOSX'))) {
+        continue;
+      }
+
+      const cliente = partes.length >= 2 ? partes[0] : null;
+      const ext = path.extname(nomeArquivo);
+      const codigoArquivo = path.basename(nomeArquivo, ext);
+      const conteudo = entrada.getData();
+
+      if (!conteudo || conteudo.length === 0) {
+        ignorados.push({ arquivo: entrada.entryName, motivo: 'Arquivo vazio' });
+        continue;
+      }
+
+      const clienteFinal = cliente || '(sem pasta)';
+      const chicoteId = cliente ? chicotesPorChave.get(chaveChicote(cliente, codigoArquivo)) || null : null;
+
+      await db.run(
+        `INSERT INTO desenhos_chicote (chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, conteudo, criadoEm)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [chicoteId, clienteFinal, codigoArquivo, nomeArquivo, ext.replace('.', '').toLowerCase() || null, conteudo.length, conteudo, agora]
+      );
+
+      importados += 1;
+      if (chicoteId) {
+        vinculados += 1;
+      } else {
+        arquivosSemVinculo.push({ arquivo: nomeArquivo, cliente: clienteFinal });
+      }
+    }
+
+    res.json({
+      totalArquivos: entradas.length,
+      importados,
+      vinculados,
+      semVinculo: arquivosSemVinculo.length,
+      arquivosSemVinculo,
+      ignorados,
+    });
+  } catch (error) {
+    console.error('Erro ao importar desenhos:', error.message, error.stack);
+    res.status(500).json({ message: 'Erro ao importar desenhos', error: error.message });
+  }
+});
+
+app.get('/desenhos', async (req, res) => {
+  try {
+    const { chicoteId, cliente, vinculado } = req.query;
+    const params = [];
+    const condicoes = [];
+    if (chicoteId) {
+      params.push(parseInt(chicoteId));
+      condicoes.push(`chicote_id = $${params.length}`);
+    }
+    if (cliente) {
+      params.push(cliente);
+      condicoes.push(`cliente = $${params.length}`);
+    }
+    if (vinculado === 'false') {
+      condicoes.push('chicote_id IS NULL');
+    } else if (vinculado === 'true') {
+      condicoes.push('chicote_id IS NOT NULL');
+    }
+    const where = condicoes.length ? `WHERE ${condicoes.join(' AND ')}` : '';
+    const desenhos = await db.all(
+      `SELECT id, chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, criadoEm
+       FROM desenhos_chicote ${where} ORDER BY cliente, codigoArquivo`,
+      params
+    );
+    res.json(desenhos.map((d) => ({
+      id: d.id,
+      chicoteId: d.chicote_id,
+      cliente: d.cliente,
+      codigoArquivo: d.codigoarquivo,
+      nomeArquivo: d.nomearquivo,
+      tipoArquivo: d.tipoarquivo,
+      tamanho: d.tamanho,
+      criadoEm: d.criadoem,
+    })));
+  } catch (error) {
+    console.error('Erro ao listar desenhos:', error.message);
+    res.status(500).json({ message: 'Erro ao listar desenhos', error: error.message });
+  }
+});
+
+app.get('/desenhos/:id/arquivo', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const desenho = await db.get(
+      'SELECT nomeArquivo, tipoArquivo, conteudo FROM desenhos_chicote WHERE id = $1',
+      [id]
+    );
+    if (!desenho) {
+      return res.status(404).json({ message: 'Desenho não encontrado' });
+    }
+    const mime = MIME_POR_EXTENSAO[(desenho.tipoarquivo || '').toLowerCase()] || 'application/octet-stream';
+    const nomeSanitizado = desenho.nomearquivo.replace(/"/g, '');
+    res.setHeader('Content-Type', mime);
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${nomeSanitizado}"; filename*=UTF-8''${encodeURIComponent(desenho.nomearquivo)}`
+    );
+    res.send(desenho.conteudo);
+  } catch (error) {
+    console.error('Erro ao baixar desenho:', error.message);
+    res.status(500).json({ message: 'Erro ao baixar desenho', error: error.message });
+  }
+});
+
+app.put('/desenhos/:id/vincular', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { chicoteId } = req.body;
+    const desenho = await db.get('SELECT id FROM desenhos_chicote WHERE id = $1', [id]);
+    if (!desenho) {
+      return res.status(404).json({ message: 'Desenho não encontrado' });
+    }
+    if (chicoteId) {
+      const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
+      if (!chicote) {
+        return res.status(404).json({ message: 'Chicote não encontrado' });
+      }
+    }
+    await db.run('UPDATE desenhos_chicote SET chicote_id = $1 WHERE id = $2', [chicoteId || null, id]);
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao vincular desenho:', error.message);
+    res.status(500).json({ message: 'Erro ao vincular desenho', error: error.message });
+  }
+});
+
+app.delete('/desenhos/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const resultado = await db.run('DELETE FROM desenhos_chicote WHERE id = $1', [id]);
+    if (resultado.changes === 0) {
+      return res.status(404).json({ message: 'Desenho não encontrado' });
+    }
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao remover desenho:', error.message);
+    res.status(500).json({ message: 'Erro ao remover desenho', error: error.message });
+  }
+});
+
 app.get('/chicotes/clientes', async (req, res) => {
   try {
     const rows = await db.all('SELECT cliente, COUNT(*)::int AS total FROM chicotes GROUP BY cliente ORDER BY cliente');
@@ -826,6 +1033,10 @@ app.get('/chicotes/:id', async (req, res) => {
        ORDER BY p.empresa, p.numeroOS`,
       [id]
     );
+    const desenhos = await db.all(
+      'SELECT id, nomeArquivo, tipoArquivo, tamanho, criadoEm FROM desenhos_chicote WHERE chicote_id = $1 ORDER BY nomeArquivo',
+      [id]
+    );
     res.json({
       id: chicote.id,
       cliente: chicote.cliente,
@@ -847,6 +1058,13 @@ app.get('/chicotes/:id', async (req, res) => {
         empresa: i.empresa,
         numeroOS: i.numeroos,
         status: i.status,
+      })),
+      desenhos: desenhos.map((d) => ({
+        id: d.id,
+        nomeArquivo: d.nomearquivo,
+        tipoArquivo: d.tipoarquivo,
+        tamanho: d.tamanho,
+        criadoEm: d.criadoem,
       })),
     });
   } catch (error) {
