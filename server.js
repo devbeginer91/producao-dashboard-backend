@@ -512,23 +512,25 @@ app.get('/pedidos', async (req, res) => {
 
 app.get('/financeiro/resumo', async (req, res) => {
   try {
+    // Todo cliente com pedido cadastrado aparece aqui, mesmo sem valor unitário ainda —
+    // é essa lista que dá acesso pra entrar no cliente e começar a preencher os valores.
     const itens = await db.all(
       `SELECT ip.quantidadePedido, ip.valorUnitario, ip.faturado, p.empresa
        FROM itens_pedidos ip
-       JOIN pedidos p ON p.id = ip.pedido_id
-       WHERE ip.valorUnitario IS NOT NULL`
+       JOIN pedidos p ON p.id = ip.pedido_id`
     );
 
     const porCliente = new Map();
     itens.forEach((item) => {
-      const valorAberto = item.faturado === 1 ? 0 : Number(item.quantidadepedido) * Number(item.valorunitario);
+      const valorAberto = item.faturado === 1 || item.valorunitario == null
+        ? 0
+        : Number(item.quantidadepedido) * Number(item.valorunitario);
       porCliente.set(item.empresa, (porCliente.get(item.empresa) || 0) + valorAberto);
     });
 
     const clientes = Array.from(porCliente.entries())
       .map(([empresa, valorEmAberto]) => ({ empresa, valorEmAberto }))
-      .filter((c) => c.valorEmAberto > 0)
-      .sort((a, b) => b.valorEmAberto - a.valorEmAberto);
+      .sort((a, b) => b.valorEmAberto - a.valorEmAberto || a.empresa.localeCompare(b.empresa));
     const totalGeral = clientes.reduce((soma, c) => soma + c.valorEmAberto, 0);
 
     res.json({ clientes, totalGeral });
