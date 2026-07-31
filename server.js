@@ -337,6 +337,24 @@ const resolverNomeEmpresa = async (empresaDigitada) => {
   return match ? match.empresa : digitada.toUpperCase();
 };
 
+// Compara como texto (formato "YYYY-MM-DD HH:MM:SS", igual ao formatDateToLocalISO) em vez
+// de "new Date(horarioLimite) < new Date()": o servidor (Render) roda em UTC, então parsear a
+// string sem fuso explícito e comparar como Date daria o horário limite como 3h mais cedo do
+// que o combinado em horário de Brasília.
+const avisoSeraoExpirado = (horarioLimite) => horarioLimite < formatDateToLocalISO(new Date());
+
+// Formata "YYYY-MM-DD"/"YYYY-MM-DD HH:MM:SS" direto como texto, sem passar por
+// `new Date(...)` — pelo mesmo motivo do avisoSeraoExpirado acima: essas strings já
+// representam horário de Brasília, e parsear como Date no servidor (UTC) desloca 3h.
+const formatarDataBR = (dataISO) => {
+  const [ano, mes, dia] = dataISO.split('-');
+  return `${dia}/${mes}/${ano}`;
+};
+const formatarDataHoraBR = (dataHoraTexto) => {
+  const [dataParte, horaParte] = dataHoraTexto.split(' ');
+  return `${formatarDataBR(dataParte)}, ${horaParte.slice(0, 5)}`;
+};
+
 // Central de notificações (sino admin/PCP) — chamada a partir dos mesmos pontos
 // que já disparam e-mail, em vez de duplicar a lógica de detecção de evento.
 const criarNotificacao = async ({ tipo, titulo, mensagem, rota }) => {
@@ -657,6 +675,32 @@ app.post('/avisos-serao', async (req, res) => {
       'INSERT INTO avisos_serao (data, horarioLimite, criadoEm) VALUES ($1, $2, $3) RETURNING id',
       [data, horarioLimite, criadoEm]
     );
+
+    const dataFormatada = formatarDataBR(data);
+    const horarioLimiteFormatado = formatarDataHoraBR(horarioLimite);
+
+    try {
+      const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
+      const destinatarios = rawEmailTo.split(',').map((e) => e.trim()).filter((e) => e.length > 0 && e.includes('@'));
+      for (const destinatario of destinatarios) {
+        await transporter.sendMail({
+          from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
+          to: destinatario,
+          subject: `Novo aviso de serão — ${dataFormatada}`,
+          text: `Um novo aviso de serão foi cadastrado.\n\nData do serão: ${dataFormatada}\nColaboradores podem responder até: ${horarioLimiteFormatado}`,
+        });
+      }
+    } catch (emailError) {
+      console.error('Erro ao enviar e-mail de aviso de serão:', emailError.message);
+    }
+
+    await criarNotificacao({
+      tipo: 'serao_criado',
+      titulo: `Novo aviso de serão — ${dataFormatada}`,
+      mensagem: `Colaboradores podem responder até ${horarioLimiteFormatado}`,
+      rota: '/avisos-serao',
+    });
+
     res.status(201).json({ id: result.id, data, horarioLimite, criadoEm });
   } catch (error) {
     console.error('Erro ao criar aviso de serão:', error.message);
@@ -755,7 +799,7 @@ app.get('/avisos-serao-ativos', async (req, res) => {
         data: aviso.data,
         horarioLimite: aviso.horariolimite,
         respostaAtual,
-        expirado: new Date(aviso.horariolimite) < new Date(),
+        expirado: avisoSeraoExpirado(aviso.horariolimite),
       });
     }
     res.json(resultado);
@@ -775,7 +819,7 @@ app.put('/avisos-serao/:id/resposta', async (req, res) => {
     if (!aviso) {
       return res.status(404).json({ message: 'Aviso não encontrado' });
     }
-    if (new Date(aviso.horariolimite) < new Date()) {
+    if (avisoSeraoExpirado(aviso.horariolimite)) {
       return res.status(403).json({ message: 'O horário limite pra responder esse aviso já passou.' });
     }
     const colaborador = await db.get('SELECT id, nome FROM colaboradores WHERE id = $1', [colaboradorId]);
