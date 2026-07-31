@@ -289,6 +289,22 @@ const initializeDatabase = async () => {
   }
 };
 
+const removerAcentos = (str) => (str || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+const chaveComparacaoEmpresa = (str) => removerAcentos(str).trim().toUpperCase().replace(/\s+/g, ' ');
+
+// Evita duplicar cliente por erro de digitação de acento/caixa/espaço (ex: "PROGAS" vs
+// "PROGÁS"): se já existe um cliente com a mesma grafia normalizada, usa a grafia já
+// cadastrada; senão, padroniza espaço/caixa mas preserva os acentos digitados (cliente novo).
+const resolverNomeEmpresa = async (empresaDigitada) => {
+  const digitada = (empresaDigitada || '').trim().replace(/\s+/g, ' ');
+  if (!digitada) return digitada;
+  const chave = chaveComparacaoEmpresa(digitada);
+  const existentes = await db.all('SELECT DISTINCT empresa FROM pedidos');
+  const match = existentes.find((e) => chaveComparacaoEmpresa(e.empresa) === chave);
+  return match ? match.empresa : digitada.toUpperCase();
+};
+
 const converterFormatoData = (dataInput) => {
   if (!dataInput || typeof dataInput !== 'string' || dataInput.includes('undefined')) {
     return new Date().toISOString().slice(0, 19).replace('T', ' ');
@@ -362,6 +378,29 @@ app.post('/login', (req, res) => {
   }
 });
 
+app.get('/pcp/usuarios', async (req, res) => {
+  try {
+    const usuarios = await db.all('SELECT id, username, nome, criadoEm FROM usuarios_pcp ORDER BY nome');
+    res.json(usuarios.map((u) => ({ id: u.id, username: u.username, nome: u.nome, criadoEm: u.criadoem })));
+  } catch (error) {
+    console.error('Erro ao listar usuários PCP:', error.message);
+    res.status(500).json({ message: 'Erro ao listar usuários PCP', error: error.message });
+  }
+});
+
+app.delete('/pcp/usuarios/:id', async (req, res) => {
+  try {
+    const resultado = await db.run('DELETE FROM usuarios_pcp WHERE id = $1', [req.params.id]);
+    if (resultado.changes === 0) {
+      return res.status(404).json({ message: 'Usuário PCP não encontrado' });
+    }
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao remover usuário PCP:', error.message);
+    res.status(500).json({ message: 'Erro ao remover usuário PCP', error: error.message });
+  }
+});
+
 app.post('/pcp/usuarios', async (req, res) => {
   const { username, senha, nome } = req.body;
   if (!username || !senha || !nome) {
@@ -402,6 +441,101 @@ app.post('/pcp/login', async (req, res) => {
   }
 });
 
+app.get('/colaboradores', async (req, res) => {
+  try {
+    const colaboradores = await db.all('SELECT id, matricula, nome, setor, criadoEm FROM colaboradores ORDER BY nome');
+    res.json(colaboradores.map((c) => ({
+      id: c.id,
+      matricula: c.matricula,
+      nome: c.nome,
+      setor: c.setor,
+      criadoEm: c.criadoem,
+    })));
+  } catch (error) {
+    console.error('Erro ao listar colaboradores:', error.message);
+    res.status(500).json({ message: 'Erro ao listar colaboradores', error: error.message });
+  }
+});
+
+app.get('/colaboradores/:id/execucoes', async (req, res) => {
+  try {
+    const colaborador = await db.get('SELECT id, nome, matricula FROM colaboradores WHERE id = $1', [req.params.id]);
+    if (!colaborador) {
+      return res.status(404).json({ message: 'Colaborador não encontrado' });
+    }
+    const execucoes = await db.all(
+      `SELECT ex.id, ex.status, ex.inicio, ex.dataConclusao, ex.tempoAcumulado,
+              ec.nome AS etapaNome, c.cliente, c.codigoItemCliente, p.empresa, p.numeroOS
+       FROM execucoes_etapa ex
+       JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
+       JOIN chicotes c ON c.id = ec.chicote_id
+       JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
+       JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ex.colaborador_id = $1
+       ORDER BY ex.inicio DESC`,
+      [req.params.id]
+    );
+    res.json({
+      colaborador: { id: colaborador.id, nome: colaborador.nome, matricula: colaborador.matricula },
+      execucoes: execucoes.map((ex) => ({
+        id: ex.id,
+        status: ex.status,
+        inicio: ex.inicio,
+        dataConclusao: ex.dataconclusao,
+        tempoSegundos: Number(ex.tempoacumulado) || 0,
+        etapaNome: ex.etapanome,
+        cliente: ex.cliente,
+        codigoItemCliente: ex.codigoitemcliente,
+        empresa: ex.empresa,
+        numeroOS: ex.numeroos,
+      })),
+    });
+  } catch (error) {
+    console.error('Erro ao buscar execuções do colaborador:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar execuções do colaborador', error: error.message });
+  }
+});
+
+app.delete('/execucoes-etapa/:id', async (req, res) => {
+  try {
+    const resultado = await db.run('DELETE FROM execucoes_etapa WHERE id = $1', [req.params.id]);
+    if (resultado.changes === 0) {
+      return res.status(404).json({ message: 'Execução não encontrada' });
+    }
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao remover execução:', error.message);
+    res.status(500).json({ message: 'Erro ao remover execução', error: error.message });
+  }
+});
+
+app.delete('/colaboradores/:id', async (req, res) => {
+  try {
+    // colaborador_id em execucoes_etapa é ON DELETE CASCADE — apagar aqui apagaria
+    // junto todo o histórico de execuções/tempos desse colaborador. Por padrão bloqueia
+    // se já existir alguma; passando ?apagarHistorico=true o admin confirma que quer
+    // apagar login e histórico juntos (ex: colaborador de teste).
+    const temExecucoes = await db.all(
+      'SELECT id FROM execucoes_etapa WHERE colaborador_id = $1',
+      [req.params.id]
+    );
+    if (temExecucoes.length > 0 && req.query.apagarHistorico !== 'true') {
+      return res.status(409).json({
+        message: 'Esse colaborador já tem histórico de execuções registrado.',
+        execucoes: temExecucoes.length,
+      });
+    }
+    const resultado = await db.run('DELETE FROM colaboradores WHERE id = $1', [req.params.id]);
+    if (resultado.changes === 0) {
+      return res.status(404).json({ message: 'Colaborador não encontrado' });
+    }
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao remover colaborador:', error.message);
+    res.status(500).json({ message: 'Erro ao remover colaborador', error: error.message });
+  }
+});
+
 app.post('/colaboradores', async (req, res) => {
   const { matricula, nome, setor } = req.body;
   if (!matricula || !nome || !setor) {
@@ -437,6 +571,16 @@ app.post('/colaboradores/login', async (req, res) => {
   } catch (error) {
     console.error('Erro ao autenticar colaborador:', error.message);
     res.status(500).json({ message: 'Erro ao autenticar', error: error.message });
+  }
+});
+
+app.get('/pedidos/empresas', async (req, res) => {
+  try {
+    const linhas = await db.all('SELECT DISTINCT empresa FROM pedidos ORDER BY empresa');
+    res.json(linhas.map((l) => l.empresa));
+  } catch (error) {
+    console.error('Erro ao listar empresas:', error.message);
+    res.status(500).json({ message: 'Erro ao listar empresas', error: error.message });
   }
 });
 
@@ -1052,6 +1196,14 @@ app.get('/chicotes', async (req, res) => {
     );
     const etapaCounts = await db.all('SELECT chicote_id, COUNT(*)::int AS total FROM etapas_chicote GROUP BY chicote_id');
     const etapaCountMap = new Map(etapaCounts.map((e) => [e.chicote_id, e.total]));
+    const execucaoCounts = await db.all(
+      `SELECT ec.chicote_id, COUNT(*)::int AS total
+       FROM execucoes_etapa ex
+       JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
+       WHERE ex.status = 'concluido'
+       GROUP BY ec.chicote_id`
+    );
+    const execucaoCountMap = new Map(execucaoCounts.map((e) => [e.chicote_id, e.total]));
     res.json(chicotes.map((c) => ({
       id: c.id,
       cliente: c.cliente,
@@ -1059,6 +1211,7 @@ app.get('/chicotes', async (req, res) => {
       codigoDca: c.codigodca,
       tempoIdeal: c.tempoideal,
       temEtapas: (etapaCountMap.get(c.id) || 0) > 0,
+      totalExecucoes: execucaoCountMap.get(c.id) || 0,
     })));
   } catch (error) {
     console.error('Erro ao listar chicotes:', error.message);
@@ -2362,6 +2515,7 @@ app.put('/pedidos/:id', async (req, res) => {
   const dataInicioPausaFormatada = dataInicioPausa ? converterFormatoData(dataInicioPausa) : null;
 
   const tempoFinal = pausado === '1' ? Number(tempoPausado) : Number(tempo);
+  const empresaResolvida = empresa ? await resolverNomeEmpresa(empresa) : empresa;
 
   const client = await pool.connect();
 
@@ -2390,7 +2544,7 @@ app.put('/pedidos/:id', async (req, res) => {
       RETURNING *
     `;
     const pedidoValues = [
-      empresa || null,
+      empresaResolvida || null,
       numeroOS || null,
       dataEntrada || null,
       previsaoEntrega || null,
@@ -2596,13 +2750,14 @@ app.post('/pedidos', async (req, res) => {
   }
 
   const inicioFormatado = converterFormatoData(inicio);
+  const empresaResolvida = await resolverNomeEmpresa(empresa);
 
   const pedidoSql = `
     INSERT INTO pedidos (empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel, status, inicio, tempo, tempoPausado, pausado, ocCliente)
     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0, $8)
     RETURNING id
   `;
-  const pedidoValues = [empresa, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado, ocCliente || null];
+  const pedidoValues = [empresaResolvida, numeroOS, dataEntrada, previsaoEntrega, responsavel || null, status, inicioFormatado, ocCliente || null];
 
   const client = await pool.connect();
 
@@ -2643,7 +2798,7 @@ app.post('/pedidos', async (req, res) => {
 
     const novoPedido = {
       id: pedidoId,
-      empresa,
+      empresa: empresaResolvida,
       numeroOS,
       dataEntrada,
       previsaoEntrega,
