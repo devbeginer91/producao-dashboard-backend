@@ -858,12 +858,15 @@ app.get('/pedidos/empresas', async (req, res) => {
 
 app.get('/pedidos', async (req, res) => {
   try {
-    const { empresa } = req.query;
-    const pedidos = empresa
+    const { empresa, id } = req.query;
+    const filtrado = Boolean(empresa || id);
+    const pedidos = id
+      ? await db.all('SELECT * FROM pedidos WHERE id = $1', [parseInt(id)])
+      : empresa
       ? await db.all('SELECT * FROM pedidos WHERE empresa = $1', [empresa])
       : await db.all('SELECT * FROM pedidos');
     const pedidoIds = pedidos.map((p) => p.id);
-    const itens = empresa
+    const itens = filtrado
       ? (pedidoIds.length > 0 ? await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = ANY($1::int[])', [pedidoIds]) : [])
       : await db.all('SELECT * FROM itens_pedidos');
     const obsCounts = await db.all('SELECT pedido_id, COUNT(*)::int AS count FROM historico_observacoes GROUP BY pedido_id');
