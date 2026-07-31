@@ -305,6 +305,17 @@ const initializeDatabase = async () => {
         UNIQUE (aviso_id, colaborador_id)
       )
     `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS notificacoes (
+        id SERIAL PRIMARY KEY,
+        tipo TEXT NOT NULL,
+        titulo TEXT NOT NULL,
+        mensagem TEXT,
+        rota TEXT,
+        criadoEm TEXT NOT NULL
+      )
+    `);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -324,6 +335,20 @@ const resolverNomeEmpresa = async (empresaDigitada) => {
   const existentes = await db.all('SELECT DISTINCT empresa FROM pedidos');
   const match = existentes.find((e) => chaveComparacaoEmpresa(e.empresa) === chave);
   return match ? match.empresa : digitada.toUpperCase();
+};
+
+// Central de notificações (sino admin/PCP) — chamada a partir dos mesmos pontos
+// que já disparam e-mail, em vez de duplicar a lógica de detecção de evento.
+const criarNotificacao = async ({ tipo, titulo, mensagem, rota }) => {
+  try {
+    const criadoEm = formatDateToLocalISO(new Date(), 'notificacao');
+    await db.run(
+      'INSERT INTO notificacoes (tipo, titulo, mensagem, rota, criadoEm) VALUES ($1, $2, $3, $4, $5)',
+      [tipo, titulo, mensagem || null, rota || null, criadoEm]
+    );
+  } catch (error) {
+    console.error('Erro ao criar notificação:', error.message);
+  }
 };
 
 const converterFormatoData = (dataInput) => {
@@ -595,7 +620,31 @@ app.post('/colaboradores/login', async (req, res) => {
   }
 });
 
+app.get('/notificacoes', async (req, res) => {
+  try {
+    const notificacoes = await db.all('SELECT * FROM notificacoes ORDER BY id DESC LIMIT 50');
+    res.json(notificacoes.map((n) => ({
+      id: n.id,
+      tipo: n.tipo,
+      titulo: n.titulo,
+      mensagem: n.mensagem,
+      rota: n.rota,
+      criadoEm: n.criadoem,
+    })));
+  } catch (error) {
+    console.error('Erro ao listar notificações:', error.message);
+    res.status(500).json({ message: 'Erro ao listar notificações', error: error.message });
+  }
+});
+
 const RESPOSTAS_SERAO_VALIDAS = new Set(['nao_vai', 'ate_1825', 'ate_1930', 'ate_2000', 'ate_2100']);
+const RESPOSTAS_SERAO_LABELS = {
+  nao_vai: 'Não vou ficar',
+  ate_1825: 'Vou ficar até 18:25',
+  ate_1930: 'Vou ficar até 19:30',
+  ate_2000: 'Vou ficar até 20:00',
+  ate_2100: 'Vou ficar até 21:00',
+};
 
 app.post('/avisos-serao', async (req, res) => {
   const { data, horarioLimite } = req.body;
@@ -729,7 +778,7 @@ app.put('/avisos-serao/:id/resposta', async (req, res) => {
     if (new Date(aviso.horariolimite) < new Date()) {
       return res.status(403).json({ message: 'O horário limite pra responder esse aviso já passou.' });
     }
-    const colaborador = await db.get('SELECT id FROM colaboradores WHERE id = $1', [colaboradorId]);
+    const colaborador = await db.get('SELECT id, nome FROM colaboradores WHERE id = $1', [colaboradorId]);
     if (!colaborador) {
       return res.status(404).json({ message: 'Colaborador não encontrado' });
     }
@@ -740,6 +789,12 @@ app.put('/avisos-serao/:id/resposta', async (req, res) => {
        ON CONFLICT (aviso_id, colaborador_id) DO UPDATE SET resposta = $3, respondidoEm = $4`,
       [req.params.id, colaboradorId, resposta, respondidoEm]
     );
+    await criarNotificacao({
+      tipo: 'serao_resposta',
+      titulo: `${colaborador.nome} respondeu ao serão`,
+      mensagem: RESPOSTAS_SERAO_LABELS[resposta] || resposta,
+      rota: '/avisos-serao',
+    });
     res.json({ sucesso: true, resposta });
   } catch (error) {
     console.error('Erro ao registrar resposta de serão:', error.message);
@@ -1037,6 +1092,15 @@ app.put('/pedidos/:id/prioridade', async (req, res) => {
     if (result.changes === 0) {
       return res.status(404).json({ message: 'Pedido não encontrado' });
     }
+    if (prioritario) {
+      const pedido = await db.get('SELECT empresa, numeroOS FROM pedidos WHERE id = $1', [id]);
+      await criarNotificacao({
+        tipo: 'pcp_prioridade',
+        titulo: `OS ${pedido.numeroos} marcada como prioritária`,
+        mensagem: pedido.empresa,
+        rota: '/priorizar-producao',
+      });
+    }
     res.json({ id, prioritario: !!prioritario });
   } catch (error) {
     console.error('Erro ao atualizar prioridade do pedido:', error.message);
@@ -1051,6 +1115,15 @@ app.put('/pedidos/:id/ordem-prioridade', async (req, res) => {
     const result = await db.run('UPDATE pedidos SET ordemPrioridade = $1 WHERE id = $2', [ordemPrioridade ?? null, id]);
     if (result.changes === 0) {
       return res.status(404).json({ message: 'Pedido não encontrado' });
+    }
+    if (ordemPrioridade != null) {
+      const pedido = await db.get('SELECT empresa, numeroOS FROM pedidos WHERE id = $1', [id]);
+      await criarNotificacao({
+        tipo: 'pcp_prioridade',
+        titulo: `Ordem de prioridade da OS ${pedido.numeroos} alterada`,
+        mensagem: `${pedido.empresa} — posição ${ordemPrioridade}`,
+        rota: '/priorizar-producao',
+      });
     }
     res.json({ id, ordemPrioridade: ordemPrioridade ?? null });
   } catch (error) {
@@ -2219,6 +2292,12 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
               text: emailText,
             });
           }
+          await criarNotificacao({
+            tipo: 'pedido',
+            titulo: `Pedido ${pedidoFormatado.numeroOS} em andamento`,
+            mensagem: `${pedidoFormatado.empresa} — colaborador iniciou a produção.`,
+            rota: '/',
+          });
         } catch (emailError) {
           console.error('Erro ao enviar e-mail de início de produção:', emailError.message);
         }
@@ -3042,6 +3121,26 @@ app.post('/enviar-email', async (req, res) => {
         RETURNING *
       `;
       await pool.query(observacaoSql, [pedido.id, observacao.trim(), dataEdicao]);
+    }
+
+    const rotaPorStatus = { novo: '/pedidos/novos', andamento: '/', concluido: '/pedidos/concluidos' };
+    await criarNotificacao({
+      tipo: 'pedido',
+      titulo: subject,
+      mensagem: `${pedidoFormatado.empresa || ''} — OS ${pedidoFormatado.numeroOS}`.trim(),
+      rota: rotaPorStatus[pedidoFormatado.status] || '/',
+    });
+
+    const itensProntosParaFaturar = (pedidoFormatado.itens || []).filter(
+      (item) => item.valorUnitario != null && (item.quantidadeEntregue || 0) > 0
+    );
+    if (itensProntosParaFaturar.length > 0) {
+      await criarNotificacao({
+        tipo: 'financeiro_faturar',
+        titulo: `Itens prontos pra faturar — Pedido ${pedidoFormatado.numeroOS}`,
+        mensagem: `${pedidoFormatado.empresa || ''}: ${itensProntosParaFaturar.map((i) => i.codigoDesenho).join(', ')}`,
+        rota: `/financeiro/${encodeURIComponent(pedidoFormatado.empresa || '')}`,
+      });
     }
 
     res.status(200).json({ message: 'E-mails enviados com sucesso' });
