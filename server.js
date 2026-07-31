@@ -284,6 +284,27 @@ const initializeDatabase = async () => {
         criadoEm TEXT NOT NULL
       )
     `);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS avisos_serao (
+        id SERIAL PRIMARY KEY,
+        data TEXT NOT NULL,
+        horarioLimite TEXT NOT NULL,
+        criadoEm TEXT NOT NULL
+      )
+    `);
+    await db.run('ALTER TABLE avisos_serao DROP COLUMN IF EXISTS setores');
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS respostas_serao (
+        id SERIAL PRIMARY KEY,
+        aviso_id INTEGER NOT NULL REFERENCES avisos_serao(id) ON DELETE CASCADE,
+        colaborador_id INTEGER NOT NULL REFERENCES colaboradores(id) ON DELETE CASCADE,
+        resposta TEXT NOT NULL,
+        respondidoEm TEXT NOT NULL,
+        UNIQUE (aviso_id, colaborador_id)
+      )
+    `);
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err.message);
   }
@@ -571,6 +592,158 @@ app.post('/colaboradores/login', async (req, res) => {
   } catch (error) {
     console.error('Erro ao autenticar colaborador:', error.message);
     res.status(500).json({ message: 'Erro ao autenticar', error: error.message });
+  }
+});
+
+const RESPOSTAS_SERAO_VALIDAS = new Set(['nao_vai', 'ate_1825', 'ate_1930', 'ate_2000', 'ate_2100']);
+
+app.post('/avisos-serao', async (req, res) => {
+  const { data, horarioLimite } = req.body;
+  if (!data || !horarioLimite) {
+    return res.status(400).json({ message: 'Data e horário limite são obrigatórios.' });
+  }
+  try {
+    const criadoEm = formatDateToLocalISO(new Date(), 'aviso-serao');
+    const result = await db.get(
+      'INSERT INTO avisos_serao (data, horarioLimite, criadoEm) VALUES ($1, $2, $3) RETURNING id',
+      [data, horarioLimite, criadoEm]
+    );
+    res.status(201).json({ id: result.id, data, horarioLimite, criadoEm });
+  } catch (error) {
+    console.error('Erro ao criar aviso de serão:', error.message);
+    res.status(500).json({ message: 'Erro ao criar aviso de serão', error: error.message });
+  }
+});
+
+app.get('/avisos-serao', async (req, res) => {
+  try {
+    const avisos = await db.all('SELECT * FROM avisos_serao ORDER BY data DESC, id DESC');
+    const totalColaboradores = await db.get('SELECT COUNT(*)::int AS total FROM colaboradores');
+    const resultado = [];
+    for (const aviso of avisos) {
+      const respondidos = await db.get(
+        'SELECT COUNT(DISTINCT colaborador_id)::int AS total FROM respostas_serao WHERE aviso_id = $1',
+        [aviso.id]
+      );
+      resultado.push({
+        id: aviso.id,
+        data: aviso.data,
+        horarioLimite: aviso.horariolimite,
+        criadoEm: aviso.criadoem,
+        totalConvocados: totalColaboradores.total,
+        totalRespondidos: respondidos.total,
+      });
+    }
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar avisos de serão:', error.message);
+    res.status(500).json({ message: 'Erro ao listar avisos de serão', error: error.message });
+  }
+});
+
+app.get('/avisos-serao/:id', async (req, res) => {
+  try {
+    const aviso = await db.get('SELECT * FROM avisos_serao WHERE id = $1', [req.params.id]);
+    if (!aviso) {
+      return res.status(404).json({ message: 'Aviso não encontrado' });
+    }
+    const colaboradores = await db.all(
+      `SELECT col.id, col.nome, col.matricula, col.setor, rs.resposta, rs.respondidoEm
+       FROM colaboradores col
+       LEFT JOIN respostas_serao rs ON rs.colaborador_id = col.id AND rs.aviso_id = $1
+       ORDER BY col.setor, col.nome`,
+      [aviso.id]
+    );
+    res.json({
+      id: aviso.id,
+      data: aviso.data,
+      horarioLimite: aviso.horariolimite,
+      criadoEm: aviso.criadoem,
+      colaboradores: colaboradores.map((c) => ({
+        id: c.id,
+        nome: c.nome,
+        matricula: c.matricula,
+        setor: c.setor,
+        resposta: c.resposta,
+        respondidoEm: c.respondidoem,
+      })),
+    });
+  } catch (error) {
+    console.error('Erro ao buscar aviso de serão:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar aviso de serão', error: error.message });
+  }
+});
+
+app.delete('/avisos-serao/:id', async (req, res) => {
+  try {
+    const resultado = await db.run('DELETE FROM avisos_serao WHERE id = $1', [req.params.id]);
+    if (resultado.changes === 0) {
+      return res.status(404).json({ message: 'Aviso não encontrado' });
+    }
+    res.json({ sucesso: true });
+  } catch (error) {
+    console.error('Erro ao encerrar aviso de serão:', error.message);
+    res.status(500).json({ message: 'Erro ao encerrar aviso de serão', error: error.message });
+  }
+});
+
+app.get('/avisos-serao-ativos', async (req, res) => {
+  const { colaboradorId } = req.query;
+  try {
+    const avisos = await db.all('SELECT * FROM avisos_serao ORDER BY data');
+    const resultado = [];
+    for (const aviso of avisos) {
+      let respostaAtual = null;
+      if (colaboradorId) {
+        const resposta = await db.get(
+          'SELECT resposta FROM respostas_serao WHERE aviso_id = $1 AND colaborador_id = $2',
+          [aviso.id, colaboradorId]
+        );
+        respostaAtual = resposta ? resposta.resposta : null;
+      }
+      resultado.push({
+        id: aviso.id,
+        data: aviso.data,
+        horarioLimite: aviso.horariolimite,
+        respostaAtual,
+        expirado: new Date(aviso.horariolimite) < new Date(),
+      });
+    }
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao buscar avisos de serão ativos:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar avisos de serão ativos', error: error.message });
+  }
+});
+
+app.put('/avisos-serao/:id/resposta', async (req, res) => {
+  const { colaboradorId, resposta } = req.body;
+  if (!colaboradorId || !RESPOSTAS_SERAO_VALIDAS.has(resposta)) {
+    return res.status(400).json({ message: 'Colaborador e resposta válida são obrigatórios.' });
+  }
+  try {
+    const aviso = await db.get('SELECT * FROM avisos_serao WHERE id = $1', [req.params.id]);
+    if (!aviso) {
+      return res.status(404).json({ message: 'Aviso não encontrado' });
+    }
+    if (new Date(aviso.horariolimite) < new Date()) {
+      return res.status(403).json({ message: 'O horário limite pra responder esse aviso já passou.' });
+    }
+    const colaborador = await db.get('SELECT id FROM colaboradores WHERE id = $1', [colaboradorId]);
+    if (!colaborador) {
+      return res.status(404).json({ message: 'Colaborador não encontrado' });
+    }
+    const respondidoEm = formatDateToLocalISO(new Date(), 'resposta-serao');
+    await db.run(
+      `INSERT INTO respostas_serao (aviso_id, colaborador_id, resposta, respondidoEm)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (aviso_id, colaborador_id) DO UPDATE SET resposta = $3, respondidoEm = $4`,
+      [req.params.id, colaboradorId, resposta, respondidoEm]
+    );
+    res.json({ sucesso: true, resposta });
+  } catch (error) {
+    console.error('Erro ao registrar resposta de serão:', error.message);
+    res.status(500).json({ message: 'Erro ao registrar resposta de serão', error: error.message });
   }
 });
 
