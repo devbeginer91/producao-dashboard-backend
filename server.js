@@ -1096,7 +1096,7 @@ app.get('/financeiro/relatorio', async (req, res) => {
     }
 
     const itens = await db.all(
-      `SELECT ip.id, ip.dataFaturamento, ip.valorFaturado, ip.quantidadeEntregue, ip.valorUnitario, ip.codigoDesenho,
+      `SELECT ip.id, ip.dataFaturamento, ip.valorFaturado, ip.quantidadeEntregue, ip.valorUnitario, ip.codigoDesenho, ip.chicote_id,
               p.empresa, p.numeroOS, p.ocCliente
        FROM itens_pedidos ip
        JOIN pedidos p ON p.id = ip.pedido_id
@@ -1112,6 +1112,7 @@ app.get('/financeiro/relatorio', async (req, res) => {
       numeroOS: i.numeroos,
       ocCliente: i.occliente,
       codigoDesenho: i.codigodesenho,
+      chicoteId: i.chicote_id,
       quantidadeEntregue: i.quantidadeentregue,
       valorUnitario: i.valorunitario,
       valorFaturado: i.valorfaturado,
@@ -2265,6 +2266,7 @@ app.get('/ordens-producao', async (req, res) => {
             id: item.id,
             codigoDesenho: item.codigodesenho,
             quantidadePedido: item.quantidadepedido,
+            chicoteId: item.chicote_id,
             tempoIdeal: chicoteTempoIdealMap.get(item.chicote_id) ?? null,
             tempoTotalReal,
             etapas: etapasDoItem.map(({ tempoMedioConcluido, ...resto }) => resto),
@@ -2439,7 +2441,7 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
     const rows = await db.all(`
       SELECT ex.id, ex.tempoAcumulado, ex.inicio, ex.dataPausada,
              p.empresa, p.numeroOS,
-             ip.codigoDesenho,
+             ip.codigoDesenho, ip.chicote_id,
              ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
              col.nome AS colaboradorNome
       FROM execucoes_etapa ex
@@ -2455,6 +2457,7 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
       empresa: r.empresa,
       numeroOS: r.numeroos,
       codigoDesenho: r.codigodesenho,
+      chicoteId: r.chicote_id,
       etapaNome: r.etapanome,
       etapaOrdem: r.etapaordem,
       colaboradorNome: r.colaboradornome,
@@ -2581,6 +2584,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
             id: item.id,
             codigoDesenho: item.codigodesenho,
             quantidadePedido: item.quantidadepedido,
+            chicoteId: item.chicote_id,
             tempoIdeal: chicoteTempoIdealMap.get(item.chicote_id) ?? null,
             tempoTotalReal,
             etapas: etapasDoItem,
