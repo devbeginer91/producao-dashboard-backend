@@ -12,6 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const upload = multer({ storage: multer.memoryStorage() });
 const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
+const uploadDesenhos = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const MIME_POR_EXTENSAO = {
   pdf: 'application/pdf',
@@ -1390,6 +1391,80 @@ app.post('/desenhos/importar-zip', uploadZip.single('arquivo'), async (req, res)
     });
   } catch (error) {
     console.error('Erro ao importar desenhos:', error.message, error.stack);
+    res.status(500).json({ message: 'Erro ao importar desenhos', error: error.message });
+  }
+});
+
+app.post('/desenhos/importar-arquivos', uploadDesenhos.array('arquivos'), async (req, res) => {
+  try {
+    const arquivos = req.files || [];
+    if (arquivos.length === 0) {
+      return res.status(400).json({ message: 'Nenhum arquivo enviado.' });
+    }
+    const clienteInformado = (req.body.cliente || '').trim() || null;
+
+    const chicotes = await db.all('SELECT id, cliente, codigoItemCliente FROM chicotes');
+    const chaveChicote = (cliente, codigo) => `${(cliente || '').trim().toLowerCase()}::${(codigo || '').trim().toLowerCase()}`;
+    const chicotesPorChave = new Map(chicotes.map((c) => [chaveChicote(c.cliente, c.codigoitemcliente), c.id]));
+    const chicotesPorCodigo = new Map();
+    chicotes.forEach((c) => {
+      const chave = (c.codigoitemcliente || '').trim().toLowerCase();
+      if (!chicotesPorCodigo.has(chave)) chicotesPorCodigo.set(chave, []);
+      chicotesPorCodigo.get(chave).push({ id: c.id, cliente: c.cliente });
+    });
+
+    const agora = formatDateToLocalISO(new Date(), 'importar-desenhos-arquivos');
+    let importados = 0;
+    let vinculados = 0;
+    const arquivosSemVinculo = [];
+
+    for (const arquivo of arquivos) {
+      const ext = path.extname(arquivo.originalname);
+      const codigoArquivo = path.basename(arquivo.originalname, ext);
+      const conteudo = arquivo.buffer;
+      if (!conteudo || conteudo.length === 0) continue;
+
+      let clienteFinal = clienteInformado || '(sem pasta)';
+      let chicoteId = clienteInformado ? chicotesPorChave.get(chaveChicote(clienteInformado, codigoArquivo)) || null : null;
+      if (!chicoteId && !clienteInformado) {
+        const candidatos = chicotesPorCodigo.get(codigoArquivo.trim().toLowerCase()) || [];
+        if (candidatos.length === 1) {
+          chicoteId = candidatos[0].id;
+          clienteFinal = candidatos[0].cliente;
+        }
+      }
+
+      if (chicoteId) {
+        await db.run(
+          `UPDATE desenhos_chicote SET ativo = false
+           WHERE chicote_id = $1 AND LOWER(codigoArquivo) = LOWER($2) AND ativo = true`,
+          [chicoteId, codigoArquivo]
+        );
+      }
+
+      await db.run(
+        `INSERT INTO desenhos_chicote (chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, conteudo, criadoEm, ativo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)`,
+        [chicoteId, clienteFinal, codigoArquivo, arquivo.originalname, ext.replace('.', '').toLowerCase() || null, conteudo.length, conteudo, agora]
+      );
+
+      importados += 1;
+      if (chicoteId) {
+        vinculados += 1;
+      } else {
+        arquivosSemVinculo.push({ arquivo: arquivo.originalname, cliente: clienteFinal });
+      }
+    }
+
+    res.json({
+      totalArquivos: arquivos.length,
+      importados,
+      vinculados,
+      semVinculo: arquivosSemVinculo.length,
+      arquivosSemVinculo,
+    });
+  } catch (error) {
+    console.error('Erro ao importar desenhos (arquivos avulsos):', error.message, error.stack);
     res.status(500).json({ message: 'Erro ao importar desenhos', error: error.message });
   }
 });
