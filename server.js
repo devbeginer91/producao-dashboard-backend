@@ -260,9 +260,40 @@ const initializeDatabase = async () => {
     // Módulo Financeiro: OC do cliente (por pedido), valor unitário e faturamento (por item).
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS ocCliente TEXT`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS valorUnitario FLOAT`);
+    // faturado/valorFaturado/dataFaturamento vêm do modelo antigo (faturamento único por item) e
+    // ficam como cache do estado mais recente; quantidadeFaturada + historico_faturamentos abaixo
+    // são a fonte de verdade, permitindo faturar em mais de uma vez (faturamento parcial).
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS faturado INTEGER DEFAULT 0`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS valorFaturado FLOAT`);
     await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS dataFaturamento TEXT`);
+    await db.run(`ALTER TABLE itens_pedidos ADD COLUMN IF NOT EXISTS quantidadeFaturada INTEGER DEFAULT 0`);
+
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS historico_faturamentos (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL,
+        quantidadeFaturada INTEGER NOT NULL,
+        valorFaturado FLOAT NOT NULL,
+        dataFaturamento TEXT NOT NULL,
+        FOREIGN KEY (item_id) REFERENCES itens_pedidos(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Migração única: itens que já tinham sido faturados no modelo antigo (flag faturado=1,
+    // um faturamento só, valor de quantidadeEntregue na época) viram o primeiro evento do
+    // histórico, senão eles ficariam com quantidadeFaturada=0 e pareceriam nunca faturados.
+    await db.run(`
+      INSERT INTO historico_faturamentos (item_id, quantidadeFaturada, valorFaturado, dataFaturamento)
+      SELECT id, quantidadeEntregue, valorFaturado, dataFaturamento
+      FROM itens_pedidos
+      WHERE faturado = 1
+        AND valorFaturado IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM historico_faturamentos WHERE item_id = itens_pedidos.id)
+    `);
+    await db.run(`
+      UPDATE itens_pedidos SET quantidadeFaturada = quantidadeEntregue
+      WHERE faturado = 1 AND quantidadeFaturada = 0
+    `);
 
     await db.run(`
       CREATE TABLE IF NOT EXISTS financeiro_clientes_ocultos (
@@ -862,7 +893,7 @@ app.get('/pedidos/empresas', async (req, res) => {
 
 app.get('/pedidos', async (req, res) => {
   try {
-    const { empresa, id } = req.query;
+    const { empresa, id, faturado } = req.query;
     const filtrado = Boolean(empresa || id);
     const pedidos = id
       ? await db.all('SELECT * FROM pedidos WHERE id = $1', [parseInt(id)])
@@ -870,8 +901,19 @@ app.get('/pedidos', async (req, res) => {
       ? await db.all('SELECT * FROM pedidos WHERE empresa = $1', [empresa])
       : await db.all('SELECT * FROM pedidos');
     const pedidoIds = pedidos.map((p) => p.id);
+    // faturado=false: itens com saldo a faturar (quantidadeFaturada < quantidadePedido).
+    // faturado=true: itens já faturados ao menos uma vez (quantidadeFaturada > 0) — um item
+    // pode aparecer nos dois casos ao mesmo tempo quando foi faturado parcialmente.
+    // Usado pelo Financeiro pra não carregar (e reprocessar produção de) todo o histórico
+    // já faturado de um cliente antigo de uma vez.
     const itens = filtrado
-      ? (pedidoIds.length > 0 ? await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = ANY($1::int[])', [pedidoIds]) : [])
+      ? (pedidoIds.length === 0
+          ? []
+          : faturado === 'false'
+          ? await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND quantidadeFaturada < quantidadePedido', [pedidoIds])
+          : faturado === 'true'
+          ? await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = ANY($1::int[]) AND quantidadeFaturada > 0', [pedidoIds])
+          : await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = ANY($1::int[])', [pedidoIds]))
       : await db.all('SELECT * FROM itens_pedidos');
     const obsCounts = await db.all('SELECT pedido_id, COUNT(*)::int AS count FROM historico_observacoes GROUP BY pedido_id');
     const obsCountMap = new Map(obsCounts.map(o => [o.pedido_id, o.count]));
@@ -960,6 +1002,7 @@ app.get('/pedidos', async (req, res) => {
           chicoteId: item.chicote_id,
           valorUnitario: item.valorunitario,
           faturado: item.faturado === 1 || item.faturado === true,
+          quantidadeFaturada: item.quantidadefaturada || 0,
           valorFaturado: item.valorfaturado,
           dataFaturamento: item.datafaturamento,
           producao: producaoPorItem.get(item.id) || null,
@@ -975,12 +1018,15 @@ app.get('/pedidos', async (req, res) => {
 
 app.get('/financeiro/resumo', async (req, res) => {
   try {
-    // Todo cliente com pedido cadastrado aparece aqui, mesmo sem valor unitário ainda —
-    // é essa lista que dá acesso pra entrar no cliente e começar a preencher os valores.
+    // Só itens com saldo a faturar (quantidadeFaturada < quantidadePedido): cliente 100%
+    // faturado nem entra na soma, então some da lista sozinho — sem precisar listar todo
+    // mundo e filtrar depois. Cliente com item sem valorUnitario ainda cadastrado continua
+    // aparecendo (soma 0), que é o gancho pra entrar nele e preencher os valores.
     const itens = await db.all(
-      `SELECT ip.quantidadePedido, ip.valorUnitario, ip.faturado, p.empresa
+      `SELECT ip.quantidadePedido, ip.quantidadeFaturada, ip.valorUnitario, p.empresa
        FROM itens_pedidos ip
-       JOIN pedidos p ON p.id = ip.pedido_id`
+       JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ip.quantidadeFaturada < ip.quantidadePedido`
     );
     const ocultos = await db.all('SELECT empresa FROM financeiro_clientes_ocultos');
     const ocultosSet = new Set(ocultos.map((o) => o.empresa));
@@ -988,9 +1034,8 @@ app.get('/financeiro/resumo', async (req, res) => {
     const porCliente = new Map();
     itens.forEach((item) => {
       if (ocultosSet.has(item.empresa)) return;
-      const valorAberto = item.faturado === 1 || item.valorunitario == null
-        ? 0
-        : Number(item.quantidadepedido) * Number(item.valorunitario);
+      const saldoAFaturar = Number(item.quantidadepedido) - Number(item.quantidadefaturada || 0);
+      const valorAberto = item.valorunitario == null ? 0 : saldoAFaturar * Number(item.valorunitario);
       porCliente.set(item.empresa, (porCliente.get(item.empresa) || 0) + valorAberto);
     });
 
@@ -1048,43 +1093,71 @@ app.delete('/financeiro/clientes-ocultos/:empresa', async (req, res) => {
 });
 
 app.put('/itens-pedidos/:id/faturar', async (req, res) => {
+  // Fatura só o saldo ainda não faturado (quantidadeEntregue - quantidadeFaturada), não o item
+  // inteiro — permite chamar esse endpoint várias vezes conforme a produção vai entregando mais,
+  // registrando cada chamada como um evento em historico_faturamentos (faturamento parcial).
   const id = parseInt(req.params.id);
+  const client = await pool.connect();
   try {
-    const item = await db.get('SELECT * FROM itens_pedidos WHERE id = $1', [id]);
+    await client.query('BEGIN');
+
+    const itemResult = await client.query('SELECT * FROM itens_pedidos WHERE id = $1 FOR UPDATE', [id]);
+    const item = itemResult.rows[0];
     if (!item) {
-      return res.status(404).json({ message: 'Item não encontrado' });
-    }
-    if (item.faturado === 1) {
-      return res.status(400).json({ message: 'Esse item já foi faturado' });
+      throw Object.assign(new Error('Item não encontrado'), { status: 404 });
     }
     if (item.valorunitario === null || item.valorunitario === undefined) {
-      return res.status(400).json({ message: 'Cadastre o valor unitário do item antes de faturar' });
+      throw Object.assign(new Error('Cadastre o valor unitário do item antes de faturar'), { status: 400 });
     }
-    if (!item.quantidadeentregue || item.quantidadeentregue <= 0) {
-      return res.status(400).json({ message: 'Esse item ainda não teve nenhuma entrega registrada pela produção' });
+    const quantidadeFaturadaAtual = item.quantidadefaturada || 0;
+    const saldoFaturavel = Number(item.quantidadeentregue || 0) - quantidadeFaturadaAtual;
+    if (saldoFaturavel <= 0) {
+      throw Object.assign(new Error('Não há quantidade entregue pendente de faturamento pra esse item'), { status: 400 });
     }
 
-    const valorFaturado = Number(item.valorunitario) * Number(item.quantidadeentregue);
+    const valorFaturadoEvento = Number(item.valorunitario) * saldoFaturavel;
     const dataFaturamento = formatDateToLocalISO(new Date(), 'faturar-item');
-    const atualizado = await db.get(
-      `UPDATE itens_pedidos SET faturado = 1, valorFaturado = $1, dataFaturamento = $2 WHERE id = $3 RETURNING *`,
-      [valorFaturado, dataFaturamento, id]
+    const novaQuantidadeFaturada = quantidadeFaturadaAtual + saldoFaturavel;
+    const novoValorFaturadoTotal = Number(item.valorfaturado || 0) + valorFaturadoEvento;
+    const totalmenteFaturado = novaQuantidadeFaturada >= Number(item.quantidadepedido);
+
+    await client.query(
+      `INSERT INTO historico_faturamentos (item_id, quantidadeFaturada, valorFaturado, dataFaturamento)
+       VALUES ($1, $2, $3, $4)`,
+      [id, saldoFaturavel, valorFaturadoEvento, dataFaturamento]
     );
+    const updateResult = await client.query(
+      `UPDATE itens_pedidos
+       SET quantidadeFaturada = $1, valorFaturado = $2, dataFaturamento = $3, faturado = $4
+       WHERE id = $5 RETURNING *`,
+      [novaQuantidadeFaturada, novoValorFaturadoTotal, dataFaturamento, totalmenteFaturado ? 1 : 0, id]
+    );
+    const atualizado = updateResult.rows[0];
+
+    await client.query('COMMIT');
+
     res.json({
       id: atualizado.id,
+      quantidadeFaturada: atualizado.quantidadefaturada,
       valorFaturado: atualizado.valorfaturado,
       dataFaturamento: atualizado.datafaturamento,
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Erro ao faturar item:', error.message);
-    res.status(500).json({ message: 'Erro ao faturar item', error: error.message });
+    res.status(error.status || 500).json({ message: error.message || 'Erro ao faturar item' });
+  } finally {
+    client.release();
   }
 });
 
 app.get('/financeiro/relatorio', async (req, res) => {
   try {
     const { cliente, inicio, fim } = req.query;
-    const condicoes = ['ip.faturado = 1'];
+    // Cada linha é um evento de faturamento (historico_faturamentos), não o item — um item
+    // faturado em duas vezes aparece duas vezes aqui, uma por evento, que é a evidência de
+    // faturamento parcial que o relatório precisa mostrar.
+    const condicoes = [];
     const params = [];
     if (cliente) {
       params.push(cliente);
@@ -1092,20 +1165,24 @@ app.get('/financeiro/relatorio', async (req, res) => {
     }
     if (inicio) {
       params.push(inicio);
-      condicoes.push(`ip.dataFaturamento >= $${params.length}`);
+      condicoes.push(`hf.dataFaturamento >= $${params.length}`);
     }
     if (fim) {
       params.push(`${fim} 23:59:59`);
-      condicoes.push(`ip.dataFaturamento <= $${params.length}`);
+      condicoes.push(`hf.dataFaturamento <= $${params.length}`);
     }
+    const where = condicoes.length > 0 ? `WHERE ${condicoes.join(' AND ')}` : '';
 
     const itens = await db.all(
-      `SELECT ip.id, ip.dataFaturamento, ip.valorFaturado, ip.quantidadeEntregue, ip.valorUnitario, ip.codigoDesenho, ip.chicote_id,
-              p.empresa, p.numeroOS, p.ocCliente
-       FROM itens_pedidos ip
+      `SELECT hf.id, hf.dataFaturamento, hf.valorFaturado, hf.quantidadeFaturada,
+              SUM(hf.quantidadeFaturada) OVER (PARTITION BY hf.item_id ORDER BY hf.dataFaturamento, hf.id) AS quantidadeFaturadaAcumulada,
+              ip.quantidadePedido, ip.valorUnitario, ip.codigoDesenho, ip.chicote_id,
+              p.empresa, p.numeroOS, p.ocCliente, p.dataEntrada
+       FROM historico_faturamentos hf
+       JOIN itens_pedidos ip ON ip.id = hf.item_id
        JOIN pedidos p ON p.id = ip.pedido_id
-       WHERE ${condicoes.join(' AND ')}
-       ORDER BY ip.dataFaturamento DESC`,
+       ${where}
+       ORDER BY hf.dataFaturamento DESC`,
       params
     );
 
@@ -1115,11 +1192,14 @@ app.get('/financeiro/relatorio', async (req, res) => {
       empresa: i.empresa,
       numeroOS: i.numeroos,
       ocCliente: i.occliente,
+      dataEntrada: i.dataentrada,
       codigoDesenho: i.codigodesenho,
       chicoteId: i.chicote_id,
-      quantidadeEntregue: i.quantidadeentregue,
+      quantidadeFaturada: i.quantidadefaturada,
+      quantidadePedido: i.quantidadepedido,
       valorUnitario: i.valorunitario,
       valorFaturado: i.valorfaturado,
+      parcial: Number(i.quantidadefaturadaacumulada) < Number(i.quantidadepedido),
     }));
 
     const totalFaturado = resultado.reduce((soma, i) => soma + Number(i.valorFaturado), 0);
