@@ -284,6 +284,9 @@ const initializeDatabase = async () => {
         criadoEm TEXT NOT NULL
       )
     `);
+    // Ao reimportar/revincular um desenho com o mesmo código pro mesmo chicote, a versão
+    // anterior fica com ativo=false (histórico) em vez de ser substituída/perdida.
+    await db.run(`ALTER TABLE desenhos_chicote ADD COLUMN IF NOT EXISTS ativo BOOLEAN NOT NULL DEFAULT true`);
 
     await db.run(`
       CREATE TABLE IF NOT EXISTS avisos_serao (
@@ -1307,6 +1310,15 @@ app.post('/desenhos/importar-zip', uploadZip.single('arquivo'), async (req, res)
     const chicotes = await db.all('SELECT id, cliente, codigoItemCliente FROM chicotes');
     const chaveChicote = (cliente, codigo) => `${(cliente || '').trim().toLowerCase()}::${(codigo || '').trim().toLowerCase()}`;
     const chicotesPorChave = new Map(chicotes.map((c) => [chaveChicote(c.cliente, c.codigoitemcliente), c.id]));
+    // Fallback pra zip sem pasta por cliente: se o código do arquivo bate com um único
+    // chicote em toda a base, vincula mesmo assim (é o caso de reimportar/atualizar um
+    // desenho já existente sem recriar a estrutura de pastas).
+    const chicotesPorCodigo = new Map();
+    chicotes.forEach((c) => {
+      const chave = (c.codigoitemcliente || '').trim().toLowerCase();
+      if (!chicotesPorCodigo.has(chave)) chicotesPorCodigo.set(chave, []);
+      chicotesPorCodigo.get(chave).push({ id: c.id, cliente: c.cliente });
+    });
 
     const agora = formatDateToLocalISO(new Date(), 'importar-desenhos');
     const entradas = zip.getEntries().filter((e) => !e.isDirectory);
@@ -1334,12 +1346,29 @@ app.post('/desenhos/importar-zip', uploadZip.single('arquivo'), async (req, res)
         continue;
       }
 
-      const clienteFinal = cliente || '(sem pasta)';
-      const chicoteId = cliente ? chicotesPorChave.get(chaveChicote(cliente, codigoArquivo)) || null : null;
+      let clienteFinal = cliente || '(sem pasta)';
+      let chicoteId = cliente ? chicotesPorChave.get(chaveChicote(cliente, codigoArquivo)) || null : null;
+      if (!chicoteId && !cliente) {
+        const candidatos = chicotesPorCodigo.get(codigoArquivo.trim().toLowerCase()) || [];
+        if (candidatos.length === 1) {
+          chicoteId = candidatos[0].id;
+          clienteFinal = candidatos[0].cliente;
+        }
+      }
+
+      if (chicoteId) {
+        // Reimportação do mesmo código pro mesmo chicote: arquiva a versão anterior
+        // em vez de deixar as duas como "atuais".
+        await db.run(
+          `UPDATE desenhos_chicote SET ativo = false
+           WHERE chicote_id = $1 AND LOWER(codigoArquivo) = LOWER($2) AND ativo = true`,
+          [chicoteId, codigoArquivo]
+        );
+      }
 
       await db.run(
-        `INSERT INTO desenhos_chicote (chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, conteudo, criadoEm)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `INSERT INTO desenhos_chicote (chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, conteudo, criadoEm, ativo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)`,
         [chicoteId, clienteFinal, codigoArquivo, nomeArquivo, ext.replace('.', '').toLowerCase() || null, conteudo.length, conteudo, agora]
       );
 
@@ -1367,7 +1396,7 @@ app.post('/desenhos/importar-zip', uploadZip.single('arquivo'), async (req, res)
 
 app.get('/desenhos', async (req, res) => {
   try {
-    const { chicoteId, cliente, vinculado } = req.query;
+    const { chicoteId, cliente, vinculado, ativo } = req.query;
     const params = [];
     const condicoes = [];
     if (chicoteId) {
@@ -1376,17 +1405,28 @@ app.get('/desenhos', async (req, res) => {
     }
     if (cliente) {
       params.push(cliente);
-      condicoes.push(`cliente = $${params.length}`);
+      if (vinculado === 'false') {
+        // Inclui os órfãos importados sem pasta de cliente (zip sem estrutura de pastas),
+        // senão eles ficam invisíveis pra sempre e nunca aparecem pra vincular manualmente.
+        condicoes.push(`(cliente = $${params.length} OR cliente = '(sem pasta)')`);
+      } else {
+        condicoes.push(`cliente = $${params.length}`);
+      }
     }
     if (vinculado === 'false') {
       condicoes.push('chicote_id IS NULL');
     } else if (vinculado === 'true') {
       condicoes.push('chicote_id IS NOT NULL');
     }
+    if (ativo === 'true') {
+      condicoes.push('ativo = true');
+    } else if (ativo === 'false') {
+      condicoes.push('ativo = false');
+    }
     const where = condicoes.length ? `WHERE ${condicoes.join(' AND ')}` : '';
     const desenhos = await db.all(
-      `SELECT id, chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, criadoEm
-       FROM desenhos_chicote ${where} ORDER BY cliente, codigoArquivo`,
+      `SELECT id, chicote_id, cliente, codigoArquivo, nomeArquivo, tipoArquivo, tamanho, criadoEm, ativo
+       FROM desenhos_chicote ${where} ORDER BY cliente, codigoArquivo, criadoEm DESC`,
       params
     );
     res.json(desenhos.map((d) => ({
@@ -1398,6 +1438,7 @@ app.get('/desenhos', async (req, res) => {
       tipoArquivo: d.tipoarquivo,
       tamanho: d.tamanho,
       criadoEm: d.criadoem,
+      ativo: d.ativo,
     })));
   } catch (error) {
     console.error('Erro ao listar desenhos:', error.message);
@@ -1433,7 +1474,7 @@ app.put('/desenhos/:id/vincular', async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const { chicoteId } = req.body;
-    const desenho = await db.get('SELECT id FROM desenhos_chicote WHERE id = $1', [id]);
+    const desenho = await db.get('SELECT id, codigoArquivo FROM desenhos_chicote WHERE id = $1', [id]);
     if (!desenho) {
       return res.status(404).json({ message: 'Desenho não encontrado' });
     }
@@ -1442,8 +1483,15 @@ app.put('/desenhos/:id/vincular', async (req, res) => {
       if (!chicote) {
         return res.status(404).json({ message: 'Chicote não encontrado' });
       }
+      // Vincular manualmente também supera qualquer versão anterior do mesmo código
+      // já vinculada a esse chicote, mandando ela pro histórico.
+      await db.run(
+        `UPDATE desenhos_chicote SET ativo = false
+         WHERE chicote_id = $1 AND LOWER(codigoArquivo) = LOWER($2) AND id != $3 AND ativo = true`,
+        [chicoteId, desenho.codigoarquivo, id]
+      );
     }
-    await db.run('UPDATE desenhos_chicote SET chicote_id = $1 WHERE id = $2', [chicoteId || null, id]);
+    await db.run('UPDATE desenhos_chicote SET chicote_id = $1, ativo = true WHERE id = $2', [chicoteId || null, id]);
     res.json({ sucesso: true });
   } catch (error) {
     console.error('Erro ao vincular desenho:', error.message);
@@ -1462,6 +1510,40 @@ app.delete('/desenhos/:id', async (req, res) => {
   } catch (error) {
     console.error('Erro ao remover desenho:', error.message);
     res.status(500).json({ message: 'Erro ao remover desenho', error: error.message });
+  }
+});
+
+app.post('/chicotes', async (req, res) => {
+  const { cliente, codigoItemCliente, codigoDca, tempoIdeal } = req.body;
+  if (!cliente || !cliente.trim() || !codigoItemCliente || !codigoItemCliente.trim()) {
+    return res.status(400).json({ message: 'Cliente e código do item cliente são obrigatórios.' });
+  }
+  try {
+    const clienteFinal = cliente.trim();
+    const codigoFinal = codigoItemCliente.trim();
+    const existente = await db.get(
+      'SELECT id FROM chicotes WHERE cliente = $1 AND codigoItemCliente = $2',
+      [clienteFinal, codigoFinal]
+    );
+    if (existente) {
+      return res.status(409).json({ message: 'Já existe um chicote com esse código pra esse cliente.', id: existente.id });
+    }
+    const agora = formatDateToLocalISO(new Date(), 'criar-chicote');
+    const row = await db.get(
+      `INSERT INTO chicotes (cliente, codigoItemCliente, codigoDca, tempoIdeal, criadoEm, atualizadoEm)
+       VALUES ($1, $2, $3, $4, $5, $5) RETURNING id`,
+      [clienteFinal, codigoFinal, codigoDca || null, tempoIdeal === '' || tempoIdeal == null ? null : tempoIdeal, agora]
+    );
+    res.status(201).json({
+      id: row.id,
+      cliente: clienteFinal,
+      codigoItemCliente: codigoFinal,
+      codigoDca: codigoDca || null,
+      tempoIdeal: tempoIdeal === '' || tempoIdeal == null ? null : tempoIdeal,
+    });
+  } catch (error) {
+    console.error('Erro ao criar chicote:', error.message);
+    res.status(500).json({ message: 'Erro ao criar chicote', error: error.message });
   }
 });
 
@@ -1533,7 +1615,7 @@ app.get('/chicotes/:id', async (req, res) => {
       [id]
     );
     const desenhos = await db.all(
-      'SELECT id, nomeArquivo, tipoArquivo, tamanho, criadoEm FROM desenhos_chicote WHERE chicote_id = $1 ORDER BY nomeArquivo',
+      'SELECT id, nomeArquivo, tipoArquivo, tamanho, criadoEm, ativo, codigoArquivo FROM desenhos_chicote WHERE chicote_id = $1 ORDER BY ativo DESC, criadoEm DESC',
       [id]
     );
     res.json({
@@ -1564,6 +1646,8 @@ app.get('/chicotes/:id', async (req, res) => {
         tipoArquivo: d.tipoarquivo,
         tamanho: d.tamanho,
         criadoEm: d.criadoem,
+        ativo: d.ativo,
+        codigoArquivo: d.codigoarquivo,
       })),
     });
   } catch (error) {
