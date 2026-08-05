@@ -295,6 +295,24 @@ const initializeDatabase = async () => {
       WHERE faturado = 1 AND quantidadeFaturada = 0
     `);
 
+    // Migração única: PUT /pedidos/:id zerava a quantidadeEntregue ao concluir um pedido,
+    // mas em seguida sobrescrevia com o valor antigo enviado pelo formulário — pedidos
+    // concluídos ficaram com saldo pendente que nunca mais seria fechado. Corrige o saldo
+    // pra bater com "concluído" e registra a diferença no histórico de entregas.
+    const dataMigracaoSaldoConcluido = formatDateToLocalISO(new Date(), 'migracao-saldo-concluido');
+    await db.run(`
+      INSERT INTO historico_entregas (pedido_id, item_id, quantidadeEntregue, dataEdicao)
+      SELECT ip.pedido_id, ip.id, ip.quantidadePedido - ip.quantidadeEntregue, $1
+      FROM itens_pedidos ip
+      JOIN pedidos p ON p.id = ip.pedido_id
+      WHERE p.status = 'concluido' AND ip.quantidadeEntregue < ip.quantidadePedido
+    `, [dataMigracaoSaldoConcluido]);
+    await db.run(`
+      UPDATE itens_pedidos ip SET quantidadeEntregue = ip.quantidadePedido
+      FROM pedidos p
+      WHERE p.id = ip.pedido_id AND p.status = 'concluido' AND ip.quantidadeEntregue < ip.quantidadePedido
+    `);
+
     await db.run(`
       CREATE TABLE IF NOT EXISTS financeiro_clientes_ocultos (
         id SERIAL PRIMARY KEY,
@@ -3161,7 +3179,12 @@ app.put('/pedidos/:id', async (req, res) => {
         const itemExistente = itensExistentesMap.get(codigoDesenho);
         if (itemExistente) {
           const quantidadeEntregueAnterior = itemExistente.quantidadeentregue || 0;
-          const novaQuantidadeEntregue = parseInt(quantidadeEntregue || 0, 10);
+          // Concluir o pedido sempre zera o saldo (ver bloco acima), então aqui não pode
+          // confiar na quantidadeEntregue que veio no corpo da requisição — ela reflete o
+          // que o formulário tinha antes de concluir e sobrescreveria o saldo já zerado.
+          const novaQuantidadeEntregue = status === 'concluido'
+            ? parseInt(quantidadePedido, 10)
+            : parseInt(quantidadeEntregue || 0, 10);
           const quantidadeAdicionada = novaQuantidadeEntregue - quantidadeEntregueAnterior;
           // Se o formulário não mandar chicoteId/valorUnitario (undefined), preserva o que já existia
           const chicoteIdFinal = chicoteId !== undefined ? (chicoteId || null) : itemExistente.chicote_id;
@@ -3188,22 +3211,25 @@ app.put('/pedidos/:id', async (req, res) => {
             ]);
           }
         } else {
+          const quantidadeEntregueInicial = status === 'concluido'
+            ? parseInt(quantidadePedido, 10)
+            : (quantidadeEntregue || 0);
           const itemResult = await client.query(insertItemSql, [
             id,
             codigoDesenho,
             quantidadePedido,
-            quantidadeEntregue || 0,
+            quantidadeEntregueInicial,
             chicoteId || null,
             valorUnitario !== undefined && valorUnitario !== '' ? valorUnitario : null
           ]);
           updatedItem = itemResult.rows[0];
 
-          if (quantidadeEntregue > 0) {
+          if (quantidadeEntregueInicial > 0) {
             const dataEdicao = formatDateToLocalISO(new Date(), 'historico');
             await client.query(historicoSql, [
               id,
               updatedItem.id,
-              quantidadeEntregue,
+              quantidadeEntregueInicial,
               dataEdicao
             ]);
           }
