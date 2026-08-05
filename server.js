@@ -955,33 +955,39 @@ app.get('/pedidos/buscar', async (req, res) => {
 
 app.get('/pedidos', async (req, res) => {
   try {
-    const { empresa, id, faturado, status, ano } = req.query;
+    const { empresa, id, faturado, status, ano, mes } = req.query;
     // status=ativo é novo+andamento (o que precisa de acompanhamento em tempo real).
-    // status=concluido normalmente vem acompanhado de ano — concluído é centenas de pedidos,
-    // então sem esse filtro a rota volta a trazer/reprocessar produção de tudo de novo.
+    // status=concluido normalmente vem acompanhado de ano (e opcionalmente mes/empresa) —
+    // concluído é centenas de pedidos, então sem filtro a rota volta a trazer/reprocessar
+    // produção de tudo de novo.
     let pedidos;
     if (id) {
       pedidos = await db.all('SELECT * FROM pedidos WHERE id = $1', [parseInt(id)]);
-    } else if (empresa) {
-      pedidos = await db.all('SELECT * FROM pedidos WHERE empresa = $1', [empresa]);
-    } else if (status || ano) {
+    } else {
       const condicoesPedidos = [];
       const paramsPedidos = [];
+      if (empresa) {
+        paramsPedidos.push(empresa);
+        condicoesPedidos.push(`empresa = $${paramsPedidos.length}`);
+      }
       if (status === 'ativo') {
         condicoesPedidos.push(`status IN ('novo', 'andamento')`);
       } else if (status) {
         paramsPedidos.push(status);
         condicoesPedidos.push(`status = $${paramsPedidos.length}`);
       }
-      if (ano) {
+      if (ano && mes) {
+        paramsPedidos.push(`${ano}-${String(mes).padStart(2, '0')}-%`);
+        condicoesPedidos.push(`dataConclusao LIKE $${paramsPedidos.length}`);
+      } else if (ano) {
         paramsPedidos.push(`${ano}-%`);
         condicoesPedidos.push(`dataConclusao LIKE $${paramsPedidos.length}`);
       }
-      pedidos = await db.all(`SELECT * FROM pedidos WHERE ${condicoesPedidos.join(' AND ')}`, paramsPedidos);
-    } else {
-      pedidos = await db.all('SELECT * FROM pedidos');
+      pedidos = condicoesPedidos.length > 0
+        ? await db.all(`SELECT * FROM pedidos WHERE ${condicoesPedidos.join(' AND ')}`, paramsPedidos)
+        : await db.all('SELECT * FROM pedidos');
     }
-    const filtrado = Boolean(empresa || id || status || ano);
+    const filtrado = Boolean(empresa || id || status || ano || mes);
     const pedidoIds = pedidos.map((p) => p.id);
     // faturado=false: itens com saldo a faturar (quantidadeFaturada < quantidadePedido).
     // faturado=true: itens já faturados ao menos uma vez (quantidadeFaturada > 0) — um item
