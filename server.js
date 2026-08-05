@@ -909,15 +909,79 @@ app.get('/pedidos/empresas', async (req, res) => {
   }
 });
 
+app.get('/pedidos/concluidos/resumo', async (req, res) => {
+  // Alimenta o seletor de ano da tela de Concluídos e o contador do menu, sem precisar
+  // trazer os pedidos inteiros (com itens/produção) só pra saber quantos existem.
+  try {
+    const linhas = await db.all(`
+      SELECT substring(dataConclusao, 1, 4) AS ano, COUNT(*)::int AS total
+      FROM pedidos
+      WHERE status = 'concluido' AND dataConclusao IS NOT NULL
+      GROUP BY ano
+      ORDER BY ano DESC
+    `);
+    const anos = linhas.filter((l) => l.ano).map((l) => ({ ano: l.ano, total: l.total }));
+    const total = anos.reduce((soma, a) => soma + a.total, 0);
+    res.json({ anos, total });
+  } catch (error) {
+    console.error('Erro ao gerar resumo de concluídos:', error.message);
+    res.status(500).json({ message: 'Erro ao gerar resumo de concluídos', error: error.message });
+  }
+});
+
+app.get('/pedidos/buscar', async (req, res) => {
+  // Busca leve (id/empresa/OS/status only) usada pela caixa de busca global — não traz
+  // itens/produção, então pode varrer todo o histórico (inclusive concluídos antigos)
+  // sem o custo de GET /pedidos completo.
+  try {
+    const termo = (req.query.termo || '').trim();
+    if (termo.length < 2) {
+      return res.json([]);
+    }
+    const linhas = await db.all(
+      `SELECT id, empresa, numeroOS, status
+       FROM pedidos
+       WHERE empresa ILIKE '%' || $1 || '%' OR numeroOS ILIKE '%' || $1 || '%'
+       ORDER BY id DESC
+       LIMIT 20`,
+      [termo]
+    );
+    res.json(linhas.map((p) => ({ id: p.id, empresa: p.empresa, numeroOS: p.numeroos, status: p.status })));
+  } catch (error) {
+    console.error('Erro ao buscar pedidos:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar pedidos', error: error.message });
+  }
+});
+
 app.get('/pedidos', async (req, res) => {
   try {
-    const { empresa, id, faturado } = req.query;
-    const filtrado = Boolean(empresa || id);
-    const pedidos = id
-      ? await db.all('SELECT * FROM pedidos WHERE id = $1', [parseInt(id)])
-      : empresa
-      ? await db.all('SELECT * FROM pedidos WHERE empresa = $1', [empresa])
-      : await db.all('SELECT * FROM pedidos');
+    const { empresa, id, faturado, status, ano } = req.query;
+    // status=ativo é novo+andamento (o que precisa de acompanhamento em tempo real).
+    // status=concluido normalmente vem acompanhado de ano — concluído é centenas de pedidos,
+    // então sem esse filtro a rota volta a trazer/reprocessar produção de tudo de novo.
+    let pedidos;
+    if (id) {
+      pedidos = await db.all('SELECT * FROM pedidos WHERE id = $1', [parseInt(id)]);
+    } else if (empresa) {
+      pedidos = await db.all('SELECT * FROM pedidos WHERE empresa = $1', [empresa]);
+    } else if (status || ano) {
+      const condicoesPedidos = [];
+      const paramsPedidos = [];
+      if (status === 'ativo') {
+        condicoesPedidos.push(`status IN ('novo', 'andamento')`);
+      } else if (status) {
+        paramsPedidos.push(status);
+        condicoesPedidos.push(`status = $${paramsPedidos.length}`);
+      }
+      if (ano) {
+        paramsPedidos.push(`${ano}-%`);
+        condicoesPedidos.push(`dataConclusao LIKE $${paramsPedidos.length}`);
+      }
+      pedidos = await db.all(`SELECT * FROM pedidos WHERE ${condicoesPedidos.join(' AND ')}`, paramsPedidos);
+    } else {
+      pedidos = await db.all('SELECT * FROM pedidos');
+    }
+    const filtrado = Boolean(empresa || id || status || ano);
     const pedidoIds = pedidos.map((p) => p.id);
     // faturado=false: itens com saldo a faturar (quantidadeFaturada < quantidadePedido).
     // faturado=true: itens já faturados ao menos uma vez (quantidadeFaturada > 0) — um item
