@@ -2803,8 +2803,8 @@ app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
 app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
   const id = parseInt(req.params.id);
   const quantidadeProduzida = parseInt(req.body?.quantidadeProduzida);
-  if (!Number.isInteger(quantidadeProduzida) || quantidadeProduzida <= 0) {
-    return res.status(400).json({ message: 'Informe quantas peças foram feitas (quantidadeProduzida deve ser um inteiro maior que zero).' });
+  if (!Number.isInteger(quantidadeProduzida) || quantidadeProduzida < 0) {
+    return res.status(400).json({ message: 'Informe quantas peças foram feitas (quantidadeProduzida deve ser um inteiro maior ou igual a zero).' });
   }
   try {
     const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
@@ -2826,10 +2826,11 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
     );
     const qtdPedido = Number(itemInfo?.quantidadepedido) || 0;
     const somaJaProduzida = Number(jaProduzidas.total) || 0;
-    const restanteAntes = qtdPedido > 0 ? qtdPedido - somaJaProduzida : null;
-    if (restanteAntes != null && quantidadeProduzida > restanteAntes) {
-      return res.status(400).json({ message: `Só restam ${restanteAntes} peça(s) pra concluir nessa etapa.` });
-    }
+    // Não bloqueia por quantidade: várias pessoas costumam trabalhar na mesma etapa ao
+    // mesmo tempo, e quem chega depois (com a etapa já batendo o total por causa de outra
+    // execução concluída nesse meio-tempo) ainda precisa conseguir concluir a própria
+    // execução — só não conta mais nada acima do total pra "quantidadeRestante" no relatório.
+    const restanteAntes = qtdPedido > 0 ? Math.max(0, qtdPedido - somaJaProduzida) : null;
 
     const agora = formatDateToLocalISO(new Date(), 'concluir-etapa');
     let tempoFinal = Number(exec.tempoacumulado) || 0;
@@ -2841,8 +2842,8 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
       [tempoFinal, agora, quantidadeProduzida, id]
     );
 
-    const restante = restanteAntes != null ? restanteAntes - quantidadeProduzida : null;
-    const etapaCompleta = restante == null || restante <= 0;
+    const restante = restanteAntes != null ? Math.max(0, restanteAntes - quantidadeProduzida) : null;
+    const etapaCompleta = restanteAntes == null || restanteAntes - quantidadeProduzida <= 0;
     const [colaborador, etapa] = await Promise.all([
       db.get('SELECT nome FROM colaboradores WHERE id = $1', [exec.colaborador_id]),
       db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [exec.etapa_chicote_id]),
