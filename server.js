@@ -353,6 +353,16 @@ const initializeDatabase = async () => {
     // anterior fica com ativo=false (histórico) em vez de ser substituída/perdida.
     await db.run(`ALTER TABLE desenhos_chicote ADD COLUMN IF NOT EXISTS ativo BOOLEAN NOT NULL DEFAULT true`);
 
+    // Configuração simples chave/valor. Usada hoje pro sinal de "reiniciar app" (admin
+    // dispara depois de um deploy; todo app aberto — colaborador ou PCP — recarrega
+    // sozinho ao notar que o valor mudou).
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS app_config (
+        chave TEXT PRIMARY KEY,
+        valor TEXT
+      )
+    `);
+
     await db.run(`
       CREATE TABLE IF NOT EXISTS avisos_serao (
         id SERIAL PRIMARY KEY,
@@ -507,6 +517,34 @@ app.post('/login', (req, res) => {
     res.json({ success: true });
   } else {
     res.status(401).json({ success: false });
+  }
+});
+
+// Sinal de "reiniciar app": o frontend (colaborador e PCP) faz polling desse valor e
+// recarrega a página sozinho quando ele muda — usado depois de um deploy pra garantir
+// que quem já estava com o app aberto pegue a versão nova sem precisar avisar um por um.
+app.get('/app/reload-sinal', async (req, res) => {
+  try {
+    const row = await db.get("SELECT valor FROM app_config WHERE chave = 'reload_em'");
+    res.json({ reloadEm: row?.valor || null });
+  } catch (error) {
+    console.error('Erro ao buscar sinal de reload:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar sinal de reload', error: error.message });
+  }
+});
+
+app.post('/app/reload-sinal/disparar', async (req, res) => {
+  try {
+    const agora = formatDateToLocalISO(new Date(), 'reload-sinal');
+    await db.run(
+      `INSERT INTO app_config (chave, valor) VALUES ('reload_em', $1)
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`,
+      [agora]
+    );
+    res.json({ reloadEm: agora });
+  } catch (error) {
+    console.error('Erro ao disparar sinal de reload:', error.message);
+    res.status(500).json({ message: 'Erro ao disparar sinal de reload', error: error.message });
   }
 });
 
