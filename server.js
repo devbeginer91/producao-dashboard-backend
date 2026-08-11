@@ -250,6 +250,21 @@ const initializeDatabase = async () => {
       )
     `);
 
+    // Quantas peças do item essa execução produziu — permite concluir uma etapa parcialmente
+    // (quantidade menor que a do item) e continuar liberando a etapa pra novas execuções até
+    // a soma bater a quantidade total pedida.
+    await db.run(`ALTER TABLE execucoes_etapa ADD COLUMN IF NOT EXISTS quantidadeProduzida INTEGER`);
+    // Backfill: execuções concluídas antes desse campo existir seguiam a regra antiga (1 execução
+    // = item inteiro). Sem isso, etapas já finalizadas no histórico apareceriam como incompletas.
+    await db.run(`
+      UPDATE execucoes_etapa ex
+      SET quantidadeProduzida = ip.quantidadePedido
+      FROM itens_pedidos ip
+      WHERE ex.item_pedido_id = ip.id
+        AND ex.status = 'concluido'
+        AND ex.quantidadeProduzida IS NULL
+    `);
+
     // Prioridade/ordem migrou de itens_pedidos pra pedidos (item.prioritario fica sem uso a partir daqui)
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS ordemPrioridade INTEGER`);
@@ -2123,7 +2138,7 @@ app.get('/etapas-chicote/:etapaId/colaboradores/:colaboradorId', async (req, res
     }
 
     const execucoes = await db.all(
-      `SELECT ex.id, ex.inicio, ex.dataConclusao, ex.tempoAcumulado, p.empresa, p.numeroOS
+      `SELECT ex.id, ex.inicio, ex.dataConclusao, ex.tempoAcumulado, ex.quantidadeProduzida, p.empresa, p.numeroOS
        FROM execucoes_etapa ex
        JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
        JOIN pedidos p ON p.id = ip.pedido_id
@@ -2154,6 +2169,7 @@ app.get('/etapas-chicote/:etapaId/colaboradores/:colaboradorId', async (req, res
         inicio: ex.inicio,
         dataConclusao: ex.dataconclusao,
         tempoSegundos: Math.round(Number(ex.tempoacumulado) || 0),
+        quantidadeProduzida: Number(ex.quantidadeproduzida) || 0,
       })),
     });
   } catch (error) {
@@ -2201,7 +2217,7 @@ app.get('/chicotes/:id/relatorio-tempos', async (req, res) => {
 
     const itemIds = itens.map((i) => i.id);
     const execucoes = await db.all(
-      `SELECT item_pedido_id, etapa_chicote_id, tempoAcumulado, status, dataConclusao
+      `SELECT item_pedido_id, etapa_chicote_id, tempoAcumulado, status, dataConclusao, quantidadeProduzida
        FROM execucoes_etapa
        WHERE item_pedido_id = ANY($1::int[]) AND etapa_chicote_id = ANY($2::int[])`,
       [itemIds, etapaIds]
@@ -2209,18 +2225,27 @@ app.get('/chicotes/:id/relatorio-tempos', async (req, res) => {
 
     const resultado = itens
       .map((item) => {
+        const qtd = Number(item.quantidadepedido) || 0;
+        if (!qtd || qtd <= 0) return null;
+
         const execucoesDoItem = execucoes.filter((ex) => ex.item_pedido_id === item.id);
         let todasConcluidas = true;
-        let somaTempoMedio = 0;
+        let somaTempoPorPeca = 0;
+        let quantidadeProduzidaTotal = 0;
         let conclusaoMaisRecente = null;
         etapaIds.forEach((eid) => {
           const concluidas = execucoesDoItem.filter((ex) => ex.etapa_chicote_id === eid && ex.status === 'concluido');
-          if (concluidas.length === 0) {
+          // Uma etapa só conta como concluída quando a soma das peças produzidas nela
+          // (podem ser várias execuções parciais, do mesmo colaborador ou de outros)
+          // atinge a quantidade total pedida do item.
+          const qtdProduzidaEtapa = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+          if (qtdProduzidaEtapa < qtd) {
             todasConcluidas = false;
             return;
           }
-          const tempoMedio = concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length;
-          somaTempoMedio += tempoMedio;
+          const tempoTotalEtapa = concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0);
+          somaTempoPorPeca += tempoTotalEtapa / qtdProduzidaEtapa;
+          quantidadeProduzidaTotal = Math.max(quantidadeProduzidaTotal, qtdProduzidaEtapa);
           concluidas.forEach((ex) => {
             if (ex.dataconclusao && (!conclusaoMaisRecente || ex.dataconclusao > conclusaoMaisRecente)) {
               conclusaoMaisRecente = ex.dataconclusao;
@@ -2228,10 +2253,8 @@ app.get('/chicotes/:id/relatorio-tempos', async (req, res) => {
           });
         });
         if (!todasConcluidas) return null;
-        const qtd = Number(item.quantidadepedido);
-        if (!qtd || qtd <= 0) return null;
 
-        const tempoRealSegundos = Math.round(somaTempoMedio / qtd);
+        const tempoRealSegundos = Math.round(somaTempoPorPeca);
         let classificacao = null;
         if (tempoIdealSegundos != null) {
           const limiteInferior = tempoIdealSegundos * (1 - TOLERANCIA);
@@ -2246,6 +2269,7 @@ app.get('/chicotes/:id/relatorio-tempos', async (req, res) => {
           numeroOS: item.numeroos,
           statusPedido: item.status,
           quantidadePedido: qtd,
+          quantidadeProduzida: quantidadeProduzidaTotal,
           tempoRealSegundos,
           dataConclusao: conclusaoMaisRecente,
           classificacao,
@@ -2552,15 +2576,24 @@ app.get('/ordens-producao', async (req, res) => {
       itens: itens
         .filter((item) => item.pedido_id === pedido.id)
         .map((item) => {
+          const qtd = Number(item.quantidadepedido) || 0;
           const etapasDoItem = etapas
             .filter((e) => e.chicote_id === item.chicote_id)
             .map((e) => {
               const execucoesDaEtapa = execucoes
                 .filter((ex) => ex.item_pedido_id === item.id && ex.etapa_chicote_id === e.id)
                 .sort((a, b) => b.id - a.id);
-              const minhaExecucao = execucoesDaEtapa.find((ex) => ex.colaborador_id === colaboradorId);
+              // "Minha execução" só conta se ainda estiver ativa (em_andamento/pausada) — uma
+              // execução já concluída não deve esconder o botão de iniciar se a etapa ainda
+              // não bateu a quantidade total (permite reabrir pra fazer o restante).
+              const minhaExecucao = execucoesDaEtapa.find(
+                (ex) => ex.colaborador_id === colaboradorId && ex.status !== 'concluido'
+              );
               const execucaoMaisRecente = execucoesDaEtapa[0];
               const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
+              const quantidadeProduzida = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              const quantidadeRestante = qtd > 0 ? Math.max(0, qtd - quantidadeProduzida) : null;
+              const concluida = qtd > 0 ? quantidadeProduzida >= qtd : concluidas.length > 0;
               // Tempo da etapa = média entre os colaboradores que a concluíram
               // (cada um registra seu próprio tempo; com 1 só, a "média" é o tempo dele mesmo).
               const tempoMedioConcluido = concluidas.length > 0
@@ -2568,7 +2601,10 @@ app.get('/ordens-producao', async (req, res) => {
                 : null;
               // Todas as execuções da etapa (qualquer colaborador, qualquer status), pra mostrar
               // todo mundo que trabalhou/está trabalhando na mesma etapa, não só a mais recente.
-              const execucoesEtapa = execucoesDaEtapa.map((ex) => calcularExecucaoAtual(ex));
+              const execucoesEtapa = execucoesDaEtapa.map((ex) => ({
+                ...calcularExecucaoAtual(ex),
+                quantidadeProduzida: ex.status === 'concluido' ? Number(ex.quantidadeproduzida) || 0 : null,
+              }));
               return {
                 id: e.id,
                 ordem: e.ordem,
@@ -2580,12 +2616,13 @@ app.get('/ordens-producao', async (req, res) => {
                 minhaExecucao: calcularExecucao(minhaExecucao),
                 execucaoAtual: calcularExecucaoAtual(execucaoMaisRecente),
                 execucoes: execucoesEtapa,
-                concluida: concluidas.length > 0,
+                concluida,
+                quantidadeProduzida,
+                quantidadeRestante,
                 tempoMedioConcluido,
               };
             });
-          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.tempoMedioConcluido !== null);
-          const qtd = Number(item.quantidadepedido);
+          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.concluida);
           const tempoTotalReal = todasConcluidas && qtd > 0
             ? Math.round(etapasDoItem.reduce((soma, e) => soma + e.tempoMedioConcluido, 0) / qtd)
             : null;
@@ -2626,6 +2663,26 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
     // registrando seu próprio tempo (o tempo da etapa vira a média entre eles).
     // Não há mais bloqueio por causa de outro colaborador já estar/ter estado nessa etapa.
 
+    const itemInfo = await db.get(
+      `SELECT ip.id, ip.pedido_id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+       FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ip.id = $1`,
+      [itemPedidoId]
+    );
+    if (!itemInfo) {
+      return res.status(404).json({ message: 'Item do pedido não encontrado.' });
+    }
+
+    const produzidas = await db.get(
+      `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
+       WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido'`,
+      [itemPedidoId, etapaChicoteId]
+    );
+    const qtdPedido = Number(itemInfo.quantidadepedido) || 0;
+    if (qtdPedido > 0 && Number(produzidas.total) >= qtdPedido) {
+      return res.status(409).json({ message: 'Essa etapa já produziu a quantidade total desse item.' });
+    }
+
     const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
     const execucao = await db.get(
       `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado)
@@ -2633,7 +2690,18 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       [itemPedidoId, etapaChicoteId, colaboradorId, agora]
     );
 
-    const item = await db.get('SELECT pedido_id FROM itens_pedidos WHERE id = $1', [itemPedidoId]);
+    const [colaborador, etapa] = await Promise.all([
+      db.get('SELECT nome FROM colaboradores WHERE id = $1', [colaboradorId]),
+      db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [etapaChicoteId]),
+    ]);
+    await criarNotificacao({
+      tipo: 'etapa_iniciada',
+      titulo: `${colaborador?.nome || 'Colaborador'} iniciou "${etapa?.nome || 'etapa'}"`,
+      mensagem: `${itemInfo.empresa} — OS ${itemInfo.numeroos} · ${itemInfo.codigodesenho}`,
+      rota: '/',
+    });
+
+    const item = itemInfo;
     if (item) {
       const resultadoStatus = await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
       if (resultadoStatus.changes > 0) {
@@ -2731,19 +2799,61 @@ app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
 
 app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
   const id = parseInt(req.params.id);
+  const quantidadeProduzida = parseInt(req.body?.quantidadeProduzida);
+  if (!Number.isInteger(quantidadeProduzida) || quantidadeProduzida <= 0) {
+    return res.status(400).json({ message: 'Informe quantas peças foram feitas (quantidadeProduzida deve ser um inteiro maior que zero).' });
+  }
   try {
     const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
     if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
     if (exec.status === 'concluido') {
       return res.status(400).json({ message: 'Essa etapa já foi concluída.' });
     }
+
+    const itemInfo = await db.get(
+      `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+       FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ip.id = $1`,
+      [exec.item_pedido_id]
+    );
+    const jaProduzidas = await db.get(
+      `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
+       WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido' AND id != $3`,
+      [exec.item_pedido_id, exec.etapa_chicote_id, id]
+    );
+    const qtdPedido = Number(itemInfo?.quantidadepedido) || 0;
+    const somaJaProduzida = Number(jaProduzidas.total) || 0;
+    const restanteAntes = qtdPedido > 0 ? qtdPedido - somaJaProduzida : null;
+    if (restanteAntes != null && quantidadeProduzida > restanteAntes) {
+      return res.status(400).json({ message: `Só restam ${restanteAntes} peça(s) pra concluir nessa etapa.` });
+    }
+
     const agora = formatDateToLocalISO(new Date(), 'concluir-etapa');
     let tempoFinal = Number(exec.tempoacumulado) || 0;
     if (exec.status === 'em_andamento') {
       tempoFinal += calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
     }
-    await db.run("UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2 WHERE id = $3", [tempoFinal, agora, id]);
-    res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal) });
+    await db.run(
+      "UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2, quantidadeProduzida = $3 WHERE id = $4",
+      [tempoFinal, agora, quantidadeProduzida, id]
+    );
+
+    const restante = restanteAntes != null ? restanteAntes - quantidadeProduzida : null;
+    const etapaCompleta = restante == null || restante <= 0;
+    const [colaborador, etapa] = await Promise.all([
+      db.get('SELECT nome FROM colaboradores WHERE id = $1', [exec.colaborador_id]),
+      db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [exec.etapa_chicote_id]),
+    ]);
+    await criarNotificacao({
+      tipo: 'etapa_concluida',
+      titulo: `${colaborador?.nome || 'Colaborador'} concluiu "${etapa?.nome || 'etapa'}"${etapaCompleta ? '' : ' (parcial)'}`,
+      mensagem: itemInfo
+        ? `${itemInfo.empresa} — OS ${itemInfo.numeroos} · ${itemInfo.codigodesenho} — ${quantidadeProduzida} peça(s) feita(s)${etapaCompleta ? '' : `, restam ${restante}`}.`
+        : `${quantidadeProduzida} peça(s) feita(s).`,
+      rota: '/',
+    });
+
+    res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal), quantidadeProduzida, restante, etapaCompleta });
   } catch (error) {
     console.error('Erro ao concluir etapa:', error.message);
     res.status(500).json({ message: 'Erro ao concluir etapa', error: error.message });
@@ -2760,6 +2870,36 @@ app.put('/execucoes-etapa/:id/zerar', async (req, res) => {
   } catch (error) {
     console.error('Erro ao zerar tempo da execução:', error.message);
     res.status(500).json({ message: 'Erro ao zerar tempo da execução', error: error.message });
+  }
+});
+
+// Corrige uma conclusão feita por engano: volta a etapa pra "em andamento" mantendo o
+// tempo já acumulado (o cronômetro continua de onde parou, não do zero) e limpa a
+// quantidade produzida registrada, já que ela também fazia parte do engano.
+app.put('/execucoes-etapa/:id/reabrir', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status !== 'concluido') {
+      return res.status(400).json({ message: 'Só é possível retomar uma etapa que está concluída.' });
+    }
+    const emAndamento = await db.get(
+      "SELECT id FROM execucoes_etapa WHERE colaborador_id = $1 AND status = 'em_andamento'",
+      [exec.colaborador_id]
+    );
+    if (emAndamento) {
+      return res.status(409).json({ message: 'Esse colaborador já está com outra etapa em andamento no momento. Peça pra ele pausar ou concluir antes de retomar essa.' });
+    }
+    const agora = formatDateToLocalISO(new Date(), 'reabrir-etapa');
+    await db.run(
+      "UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1, dataConclusao = NULL, quantidadeProduzida = NULL WHERE id = $2",
+      [agora, id]
+    );
+    res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
+  } catch (error) {
+    console.error('Erro ao retomar etapa concluída:', error.message);
+    res.status(500).json({ message: 'Erro ao retomar etapa concluída', error: error.message });
   }
 });
 
@@ -2860,7 +3000,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
           referenciaInicio: exec.datapausada || exec.inicio,
         };
       }
-      return { id: exec.id, status: exec.status, colaboradorNome: exec.colaboradornome, tempoAcumulado: base };
+      return { id: exec.id, status: exec.status, colaboradorNome: exec.colaboradornome, tempoAcumulado: base, quantidadeProduzida: Number(exec.quantidadeproduzida) || 0 };
     };
 
     const resultado = pedidos.map((pedido) => ({
@@ -2872,6 +3012,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
       itens: itens
         .filter((item) => item.pedido_id === pedido.id)
         .map((item) => {
+          const qtd = Number(item.quantidadepedido) || 0;
           const etapasDoItem = etapas
             .filter((e) => e.chicote_id === item.chicote_id)
             .map((e) => {
@@ -2880,6 +3021,9 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 .sort((a, b) => b.id - a.id);
               const execucaoMaisRecente = execucoesDaEtapa[0];
               const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
+              const quantidadeProduzida = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              const quantidadeRestante = qtd > 0 ? Math.max(0, qtd - quantidadeProduzida) : null;
+              const concluida = qtd > 0 ? quantidadeProduzida >= qtd : concluidas.length > 0;
               // Tempo da etapa = média entre os colaboradores que a concluíram.
               const tempoMedioConcluido = concluidas.length > 0
                 ? concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length
@@ -2897,12 +3041,13 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 instrucoes: e.instrucoes,
                 execucao: calcularExecucao(execucaoMaisRecente),
                 execucoes: execucoesEtapa,
-                concluida: concluidas.length > 0,
+                concluida,
+                quantidadeProduzida,
+                quantidadeRestante,
                 tempoMedioConcluido,
               };
             });
-          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.tempoMedioConcluido !== null);
-          const qtd = Number(item.quantidadepedido);
+          const todasConcluidas = etapasDoItem.length > 0 && etapasDoItem.every((e) => e.concluida);
           const tempoTotalReal = todasConcluidas && qtd > 0
             ? Math.round(etapasDoItem.reduce((soma, e) => soma + e.tempoMedioConcluido, 0) / qtd)
             : null;
