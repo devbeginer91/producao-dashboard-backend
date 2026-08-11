@@ -597,7 +597,7 @@ app.get('/colaboradores/:id/execucoes', async (req, res) => {
     }
     const execucoes = await db.all(
       `SELECT ex.id, ex.status, ex.inicio, ex.dataConclusao, ex.tempoAcumulado,
-              ec.nome AS etapaNome, c.cliente, c.codigoItemCliente, p.empresa, p.numeroOS
+              ec.nome AS etapaNome, c.cliente, c.codigoItemCliente, p.id AS pedidoId, p.empresa, p.numeroOS
        FROM execucoes_etapa ex
        JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
        JOIN chicotes c ON c.id = ec.chicote_id
@@ -618,6 +618,7 @@ app.get('/colaboradores/:id/execucoes', async (req, res) => {
         etapaNome: ex.etapanome,
         cliente: ex.cliente,
         codigoItemCliente: ex.codigoitemcliente,
+        pedidoId: ex.pedidoid,
         empresa: ex.empresa,
         numeroOS: ex.numeroos,
       })),
@@ -1280,7 +1281,7 @@ app.get('/financeiro/relatorio', async (req, res) => {
       `SELECT hf.id, hf.dataFaturamento, hf.valorFaturado, hf.quantidadeFaturada,
               SUM(hf.quantidadeFaturada) OVER (PARTITION BY hf.item_id ORDER BY hf.dataFaturamento, hf.id) AS quantidadeFaturadaAcumulada,
               ip.quantidadePedido, ip.valorUnitario, ip.codigoDesenho, ip.chicote_id,
-              p.empresa, p.numeroOS, p.ocCliente, p.dataEntrada
+              p.id AS pedidoId, p.empresa, p.numeroOS, p.ocCliente, p.dataEntrada
        FROM historico_faturamentos hf
        JOIN itens_pedidos ip ON ip.id = hf.item_id
        JOIN pedidos p ON p.id = ip.pedido_id
@@ -1291,6 +1292,7 @@ app.get('/financeiro/relatorio', async (req, res) => {
 
     const resultado = itens.map((i) => ({
       id: i.id,
+      pedidoId: i.pedidoid,
       dataFaturamento: i.datafaturamento,
       empresa: i.empresa,
       numeroOS: i.numeroos,
@@ -2138,7 +2140,7 @@ app.get('/etapas-chicote/:etapaId/colaboradores/:colaboradorId', async (req, res
     }
 
     const execucoes = await db.all(
-      `SELECT ex.id, ex.inicio, ex.dataConclusao, ex.tempoAcumulado, ex.quantidadeProduzida, p.empresa, p.numeroOS
+      `SELECT ex.id, ex.inicio, ex.dataConclusao, ex.tempoAcumulado, ex.quantidadeProduzida, p.id AS pedidoId, p.empresa, p.numeroOS
        FROM execucoes_etapa ex
        JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
        JOIN pedidos p ON p.id = ip.pedido_id
@@ -2164,6 +2166,7 @@ app.get('/etapas-chicote/:etapaId/colaboradores/:colaboradorId', async (req, res
       tempoMedioSegundos,
       execucoes: execucoes.map((ex) => ({
         id: ex.id,
+        pedidoId: ex.pedidoid,
         empresa: ex.empresa,
         numeroOS: ex.numeroos,
         inicio: ex.inicio,
@@ -2907,7 +2910,7 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
   try {
     const rows = await db.all(`
       SELECT ex.id, ex.tempoAcumulado, ex.inicio, ex.dataPausada,
-             p.empresa, p.numeroOS,
+             p.id AS pedidoId, p.empresa, p.numeroOS,
              ip.codigoDesenho, ip.chicote_id,
              ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
              col.nome AS colaboradorNome
@@ -2921,6 +2924,7 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
     `);
     const resultado = rows.map((r) => ({
       id: r.id,
+      pedidoId: r.pedidoid,
       empresa: r.empresa,
       numeroOS: r.numeroos,
       codigoDesenho: r.codigodesenho,
