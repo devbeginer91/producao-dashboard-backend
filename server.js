@@ -6,10 +6,24 @@ const bcrypt = require('bcryptjs');
 const path = require('path');
 const AdmZip = require('adm-zip');
 const { Pool } = require('pg');
+const webpush = require('web-push');
 const { parseChicoteWorkbook } = require('./importParser');
 require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Push notifications (sino do PCP/admin também como notificação nativa no celular).
+// Sem as chaves VAPID configuradas (ex: ambiente local sem .env), o envio simplesmente
+// não acontece — o resto do app funciona normalmente.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:dca@dcachicoteseletricos.com.br',
+    VAPID_PUBLIC_KEY,
+    VAPID_PRIVATE_KEY
+  );
+}
 const upload = multer({ storage: multer.memoryStorage() });
 const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
 const uploadDesenhos = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -363,6 +377,18 @@ const initializeDatabase = async () => {
       )
     `);
 
+    // Inscrições de push notification (sino do PCP/admin também no celular). Uma linha
+    // por navegador/dispositivo que ativou; endpoint é único por inscrição do navegador.
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        criadoEm TEXT NOT NULL
+      )
+    `);
+
     await db.run(`
       CREATE TABLE IF NOT EXISTS avisos_serao (
         id SERIAL PRIMARY KEY,
@@ -444,6 +470,35 @@ const criarNotificacao = async ({ tipo, titulo, mensagem, rota }) => {
     );
   } catch (error) {
     console.error('Erro ao criar notificação:', error.message);
+  }
+  await enviarPushParaTodos({ titulo, mensagem, rota });
+};
+
+// Manda a mesma notificação como push nativo pra quem ativou no celular/navegador.
+// Reaproveita as inscrições salvas em push_subscriptions; inscrição que não existe mais
+// (usuário desinstalou, trocou de aparelho etc — status 404/410) é removida na hora.
+const enviarPushParaTodos = async ({ titulo, mensagem, rota }) => {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const inscricoes = await db.all('SELECT * FROM push_subscriptions');
+    if (inscricoes.length === 0) return;
+    const payload = JSON.stringify({ title: titulo, body: mensagem || '', url: rota || '/' });
+    await Promise.all(inscricoes.map(async (inscricao) => {
+      try {
+        await webpush.sendNotification(
+          { endpoint: inscricao.endpoint, keys: { p256dh: inscricao.p256dh, auth: inscricao.auth } },
+          payload
+        );
+      } catch (error) {
+        if (error.statusCode === 404 || error.statusCode === 410) {
+          await db.run('DELETE FROM push_subscriptions WHERE endpoint = $1', [inscricao.endpoint]);
+        } else {
+          console.error('Erro ao enviar push:', error.message);
+        }
+      }
+    }));
+  } catch (error) {
+    console.error('Erro ao enviar notificações push:', error.message);
   }
 };
 
@@ -545,6 +600,43 @@ app.post('/app/reload-sinal/disparar', async (req, res) => {
   } catch (error) {
     console.error('Erro ao disparar sinal de reload:', error.message);
     res.status(500).json({ message: 'Erro ao disparar sinal de reload', error: error.message });
+  }
+});
+
+app.get('/push/public-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY || null });
+});
+
+app.post('/push/subscribe', async (req, res) => {
+  const { endpoint, keys } = req.body || {};
+  if (!endpoint || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({ message: 'Inscrição de push inválida.' });
+  }
+  try {
+    const criadoEm = formatDateToLocalISO(new Date(), 'push-subscribe');
+    await db.run(
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, criadoEm) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+      [endpoint, keys.p256dh, keys.auth, criadoEm]
+    );
+    res.status(201).json({ success: true });
+  } catch (error) {
+    console.error('Erro ao salvar inscrição de push:', error.message);
+    res.status(500).json({ message: 'Erro ao salvar inscrição de push', error: error.message });
+  }
+});
+
+app.post('/push/unsubscribe', async (req, res) => {
+  const { endpoint } = req.body || {};
+  if (!endpoint) {
+    return res.status(400).json({ message: 'endpoint é obrigatório.' });
+  }
+  try {
+    await db.run('DELETE FROM push_subscriptions WHERE endpoint = $1', [endpoint]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erro ao remover inscrição de push:', error.message);
+    res.status(500).json({ message: 'Erro ao remover inscrição de push', error: error.message });
   }
 });
 
