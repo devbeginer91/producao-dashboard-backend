@@ -2452,6 +2452,46 @@ app.post('/chicotes/:id/etapas', async (req, res) => {
   }
 });
 
+// Copia o passo a passo inteiro de outro chicote (modelo parecido) pra esse, em vez de
+// cadastrar etapa por etapa do zero. As etapas copiadas entram depois das que já existem.
+app.post('/chicotes/:id/etapas/copiar', async (req, res) => {
+  const chicoteId = parseInt(req.params.id);
+  const origemChicoteId = parseInt(req.body?.origemChicoteId);
+  if (!origemChicoteId) {
+    return res.status(400).json({ message: 'origemChicoteId é obrigatório.' });
+  }
+  if (origemChicoteId === chicoteId) {
+    return res.status(400).json({ message: 'Escolha um chicote diferente pra copiar.' });
+  }
+  try {
+    const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
+    if (!chicote) {
+      return res.status(404).json({ message: 'Chicote não encontrado' });
+    }
+    const etapasOrigem = await db.all(
+      'SELECT nome, setor, quemTexto, instrucoes, tempoIdeal FROM etapas_chicote WHERE chicote_id = $1 ORDER BY ordem',
+      [origemChicoteId]
+    );
+    if (etapasOrigem.length === 0) {
+      return res.status(400).json({ message: 'O chicote de origem não tem etapas cadastradas.' });
+    }
+    const ultima = await db.get('SELECT COALESCE(MAX(ordem), 0) AS maxOrdem FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+    let proximaOrdem = (Number(ultima.maxordem) || 0) + 1;
+    for (const etapa of etapasOrigem) {
+      await db.run(
+        `INSERT INTO etapas_chicote (chicote_id, ordem, nome, setor, quemTexto, instrucoes, tempoIdeal)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [chicoteId, proximaOrdem, etapa.nome, etapa.setor, etapa.quemtexto, etapa.instrucoes, etapa.tempoideal]
+      );
+      proximaOrdem += 1;
+    }
+    res.status(201).json({ copiadas: etapasOrigem.length });
+  } catch (error) {
+    console.error('Erro ao copiar etapas:', error.message);
+    res.status(500).json({ message: 'Erro ao copiar etapas', error: error.message });
+  }
+});
+
 app.put('/etapas-chicote/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const { nome, setor, quemTexto, instrucoes, tempoIdeal, ordem } = req.body;
