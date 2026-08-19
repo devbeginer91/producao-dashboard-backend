@@ -2068,123 +2068,173 @@ app.put('/chicotes/:id', async (req, res) => {
   }
 });
 
-app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
-  const chicoteId = parseInt(req.params.id);
-  try {
-    const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
-    if (!chicote) {
-      return res.status(404).json({ message: 'Chicote não encontrado' });
+// Recalcula o tempoIdeal do chicote e de cada etapa a partir das execuções concluídas.
+// Usada tanto pelo endpoint manual (botão "recalcular" na tela do chicote) quanto pelo
+// gatilho automático que roda toda vez que um item termina todas as suas etapas.
+async function calcularMediaTemposChicote(chicoteId) {
+  const chicote = await db.get('SELECT id FROM chicotes WHERE id = $1', [chicoteId]);
+  if (!chicote) {
+    return { ok: false, status: 404, message: 'Chicote não encontrado' };
+  }
+
+  const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+  if (etapas.length === 0) {
+    return { ok: false, status: 400, message: 'Esse chicote não tem etapas cadastradas.' };
+  }
+  const etapaIds = etapas.map((e) => e.id);
+
+  const itens = await db.all(
+    'SELECT id, pedido_id, quantidadePedido FROM itens_pedidos WHERE chicote_id = $1',
+    [chicoteId]
+  );
+  if (itens.length === 0) {
+    return { ok: false, status: 400, message: 'Nenhum item de pedido vinculado a esse chicote ainda.' };
+  }
+  const itemIds = itens.map((i) => i.id);
+  const itemMap = new Map(itens.map((i) => [i.id, i]));
+
+  const execucoes = await db.all(
+    `SELECT item_pedido_id, etapa_chicote_id, colaborador_id, tempoAcumulado, dataConclusao
+     FROM execucoes_etapa
+     WHERE item_pedido_id = ANY($1::int[]) AND etapa_chicote_id = ANY($2::int[]) AND status = 'concluido'`,
+    [itemIds, etapaIds]
+  );
+
+  // Tempo de uma etapa = média entre os colaboradores que a executaram
+  // (cada um registra seu próprio tempo; com 1 só colaborador, a "média" é o próprio tempo dele).
+  const tempoMedioEtapa = (execsDaEtapa) =>
+    execsDaEtapa.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / execsDaEtapa.length;
+
+  const porItem = new Map();
+  execucoes.forEach((ex) => {
+    if (!porItem.has(ex.item_pedido_id)) porItem.set(ex.item_pedido_id, new Map());
+    const mapaEtapas = porItem.get(ex.item_pedido_id);
+    if (!mapaEtapas.has(ex.etapa_chicote_id)) mapaEtapas.set(ex.etapa_chicote_id, []);
+    mapaEtapas.get(ex.etapa_chicote_id).push(ex);
+  });
+
+  const candidatosPorPedido = new Map();
+  porItem.forEach((mapaEtapas, itemPedidoId) => {
+    const completo = etapaIds.every((eid) => mapaEtapas.has(eid));
+    if (!completo) return;
+    const item = itemMap.get(itemPedidoId);
+    const todasExecucoes = Array.from(mapaEtapas.values()).flat();
+    const conclusaoMaisRecente = Math.max(...todasExecucoes.map((ex) => new Date(ex.dataconclusao).getTime()));
+    const candidato = {
+      itemPedidoId,
+      pedidoId: item.pedido_id,
+      quantidadePedido: item.quantidadepedido,
+      conclusaoMaisRecente,
+      etapaTempos: mapaEtapas,
+    };
+    const existente = candidatosPorPedido.get(item.pedido_id);
+    if (!existente || candidato.conclusaoMaisRecente > existente.conclusaoMaisRecente) {
+      candidatosPorPedido.set(item.pedido_id, candidato);
     }
+  });
 
-    const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
-    if (etapas.length === 0) {
-      return res.status(400).json({ message: 'Esse chicote não tem etapas cadastradas.' });
-    }
-    const etapaIds = etapas.map((e) => e.id);
+  const candidatosOrdenados = Array.from(candidatosPorPedido.values())
+    .sort((a, b) => b.conclusaoMaisRecente - a.conclusaoMaisRecente);
 
-    const itens = await db.all(
-      'SELECT id, pedido_id, quantidadePedido FROM itens_pedidos WHERE chicote_id = $1',
-      [chicoteId]
-    );
-    if (itens.length === 0) {
-      return res.status(400).json({ message: 'Nenhum item de pedido vinculado a esse chicote ainda.' });
-    }
-    const itemIds = itens.map((i) => i.id);
-    const itemMap = new Map(itens.map((i) => [i.id, i]));
+  const validos = [];
+  for (const candidato of candidatosOrdenados) {
+    if (validos.length >= 5) break;
+    const qtd = Number(candidato.quantidadePedido);
+    if (!qtd || qtd <= 0 || isNaN(qtd)) continue;
+    validos.push(candidato);
+  }
 
-    const execucoes = await db.all(
-      `SELECT item_pedido_id, etapa_chicote_id, colaborador_id, tempoAcumulado, dataConclusao
-       FROM execucoes_etapa
-       WHERE item_pedido_id = ANY($1::int[]) AND etapa_chicote_id = ANY($2::int[]) AND status = 'concluido'`,
-      [itemIds, etapaIds]
-    );
+  if (validos.length === 0) {
+    return { ok: false, status: 400, message: 'Não há execuções concluídas suficientes desse chicote para calcular a média.' };
+  }
 
-    // Tempo de uma etapa = média entre os colaboradores que a executaram
-    // (cada um registra seu próprio tempo; com 1 só colaborador, a "média" é o próprio tempo dele).
-    const tempoMedioEtapa = (execsDaEtapa) =>
-      execsDaEtapa.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / execsDaEtapa.length;
+  let somaTotalPorUnidade = 0;
+  const somaEtapaPorUnidade = new Map(etapaIds.map((eid) => [eid, 0]));
 
-    const porItem = new Map();
-    execucoes.forEach((ex) => {
-      if (!porItem.has(ex.item_pedido_id)) porItem.set(ex.item_pedido_id, new Map());
-      const mapaEtapas = porItem.get(ex.item_pedido_id);
-      if (!mapaEtapas.has(ex.etapa_chicote_id)) mapaEtapas.set(ex.etapa_chicote_id, []);
-      mapaEtapas.get(ex.etapa_chicote_id).push(ex);
+  validos.forEach((candidato) => {
+    const qtd = Number(candidato.quantidadePedido);
+    let totalSegundos = 0;
+    etapaIds.forEach((eid) => {
+      const tempoEtapa = tempoMedioEtapa(candidato.etapaTempos.get(eid));
+      totalSegundos += tempoEtapa;
+      somaEtapaPorUnidade.set(eid, somaEtapaPorUnidade.get(eid) + tempoEtapa / qtd);
     });
+    somaTotalPorUnidade += totalSegundos / qtd;
+  });
 
-    const candidatosPorPedido = new Map();
-    porItem.forEach((mapaEtapas, itemPedidoId) => {
-      const completo = etapaIds.every((eid) => mapaEtapas.has(eid));
-      if (!completo) return;
-      const item = itemMap.get(itemPedidoId);
-      const todasExecucoes = Array.from(mapaEtapas.values()).flat();
-      const conclusaoMaisRecente = Math.max(...todasExecucoes.map((ex) => new Date(ex.dataconclusao).getTime()));
-      const candidato = {
-        itemPedidoId,
-        pedidoId: item.pedido_id,
-        quantidadePedido: item.quantidadepedido,
-        conclusaoMaisRecente,
-        etapaTempos: mapaEtapas,
-      };
-      const existente = candidatosPorPedido.get(item.pedido_id);
-      if (!existente || candidato.conclusaoMaisRecente > existente.conclusaoMaisRecente) {
-        candidatosPorPedido.set(item.pedido_id, candidato);
-      }
-    });
+  const paraMinutos = (segundos) => Math.round((segundos / 60) * 10) / 10;
+  const mediaTotalMin = paraMinutos(somaTotalPorUnidade / validos.length);
+  const mediasEtapas = etapaIds.map((eid) => ({
+    id: eid,
+    tempoIdeal: paraMinutos(somaEtapaPorUnidade.get(eid) / validos.length),
+  }));
 
-    const candidatosOrdenados = Array.from(candidatosPorPedido.values())
-      .sort((a, b) => b.conclusaoMaisRecente - a.conclusaoMaisRecente);
+  const agora = formatDateToLocalISO(new Date(), 'media-tempos-chicote');
+  await db.run('UPDATE chicotes SET tempoIdeal = $1, atualizadoEm = $2 WHERE id = $3', [mediaTotalMin, agora, chicoteId]);
+  for (const m of mediasEtapas) {
+    await db.run('UPDATE etapas_chicote SET tempoIdeal = $1 WHERE id = $2', [m.tempoIdeal, m.id]);
+  }
 
-    const validos = [];
-    for (const candidato of candidatosOrdenados) {
-      if (validos.length >= 5) break;
-      const qtd = Number(candidato.quantidadePedido);
-      if (!qtd || qtd <= 0 || isNaN(qtd)) continue;
-      validos.push(candidato);
-    }
+  const pedidosUsados = await db.all(
+    'SELECT id, empresa, numeroOS FROM pedidos WHERE id = ANY($1::int[])',
+    [validos.map((v) => v.pedidoId)]
+  );
 
-    if (validos.length === 0) {
-      return res.status(400).json({ message: 'Não há execuções concluídas suficientes desse chicote para calcular a média.' });
-    }
-
-    let somaTotalPorUnidade = 0;
-    const somaEtapaPorUnidade = new Map(etapaIds.map((eid) => [eid, 0]));
-
-    validos.forEach((candidato) => {
-      const qtd = Number(candidato.quantidadePedido);
-      let totalSegundos = 0;
-      etapaIds.forEach((eid) => {
-        const tempoEtapa = tempoMedioEtapa(candidato.etapaTempos.get(eid));
-        totalSegundos += tempoEtapa;
-        somaEtapaPorUnidade.set(eid, somaEtapaPorUnidade.get(eid) + tempoEtapa / qtd);
-      });
-      somaTotalPorUnidade += totalSegundos / qtd;
-    });
-
-    const paraMinutos = (segundos) => Math.round((segundos / 60) * 10) / 10;
-    const mediaTotalMin = paraMinutos(somaTotalPorUnidade / validos.length);
-    const mediasEtapas = etapaIds.map((eid) => ({
-      id: eid,
-      tempoIdeal: paraMinutos(somaEtapaPorUnidade.get(eid) / validos.length),
-    }));
-
-    const agora = formatDateToLocalISO(new Date(), 'media-tempos-chicote');
-    await db.run('UPDATE chicotes SET tempoIdeal = $1, atualizadoEm = $2 WHERE id = $3', [mediaTotalMin, agora, chicoteId]);
-    for (const m of mediasEtapas) {
-      await db.run('UPDATE etapas_chicote SET tempoIdeal = $1 WHERE id = $2', [m.tempoIdeal, m.id]);
-    }
-
-    const pedidosUsados = await db.all(
-      'SELECT id, empresa, numeroOS FROM pedidos WHERE id = ANY($1::int[])',
-      [validos.map((v) => v.pedidoId)]
-    );
-
-    res.json({
+  return {
+    ok: true,
+    data: {
       tempoIdeal: mediaTotalMin,
       etapas: mediasEtapas,
       execucoesUsadas: validos.length,
       pedidos: pedidosUsados.map((p) => ({ empresa: p.empresa, numeroOS: p.numeroos })),
-    });
+    },
+  };
+}
+
+// Um item está completo quando toda etapa do chicote tem quantidade produzida suficiente
+// (ou, pra chicotes sem quantidade definida, ao menos uma execução concluída).
+async function itemEstaCompleto(itemPedidoId, chicoteId, quantidadePedido) {
+  if (!chicoteId) return false;
+  const etapas = await db.all('SELECT id FROM etapas_chicote WHERE chicote_id = $1', [chicoteId]);
+  if (etapas.length === 0) return false;
+  const execs = await db.all(
+    `SELECT etapa_chicote_id, quantidadeProduzida FROM execucoes_etapa
+     WHERE item_pedido_id = $1 AND etapa_chicote_id = ANY($2::int[]) AND status = 'concluido'`,
+    [itemPedidoId, etapas.map((e) => e.id)]
+  );
+  const qtd = Number(quantidadePedido) || 0;
+  return etapas.every((etapa) => {
+    const execsDaEtapa = execs.filter((ex) => ex.etapa_chicote_id === etapa.id);
+    if (execsDaEtapa.length === 0) return false;
+    if (qtd <= 0) return true;
+    const produzida = execsDaEtapa.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+    return produzida >= qtd;
+  });
+}
+
+// Dispara o recálculo de média assim que a conclusão de uma etapa fecha todas as etapas
+// do item — sem isso, o tempoIdeal do chicote só atualizava com o clique manual de
+// "recalcular" na tela do chicote, o que deixava o "tempo por chicote" sumido na prática.
+async function recalcularMediaSeItemCompleto(itemPedidoId) {
+  try {
+    const item = await db.get('SELECT chicote_id, quantidadePedido FROM itens_pedidos WHERE id = $1', [itemPedidoId]);
+    if (!item?.chicote_id) return;
+    const completo = await itemEstaCompleto(itemPedidoId, item.chicote_id, item.quantidadepedido);
+    if (!completo) return;
+    await calcularMediaTemposChicote(item.chicote_id);
+  } catch (error) {
+    console.error('Erro ao recalcular média de tempos após conclusão de etapa:', error.message);
+  }
+}
+
+app.post('/chicotes/:id/calcular-media-tempos', async (req, res) => {
+  const chicoteId = parseInt(req.params.id);
+  try {
+    const resultado = await calcularMediaTemposChicote(chicoteId);
+    if (!resultado.ok) {
+      return res.status(resultado.status).json({ message: resultado.message });
+    }
+    res.json(resultado.data);
   } catch (error) {
     console.error('Erro ao calcular média de tempos do chicote:', error.message);
     res.status(500).json({ message: 'Erro ao calcular média de tempos do chicote', error: error.message });
@@ -3027,10 +3077,71 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
       rota: '/',
     });
 
+    await recalcularMediaSeItemCompleto(exec.item_pedido_id);
+
     res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal), quantidadeProduzida, restante, etapaCompleta });
   } catch (error) {
     console.error('Erro ao concluir etapa:', error.message);
     res.status(500).json({ message: 'Erro ao concluir etapa', error: error.message });
+  }
+});
+
+// Conclui direto uma etapa que nunca foi iniciada por ninguém — usado pelo admin pra fechar
+// etapas "puladas"/esquecidas sem precisar simular um início. Tempo fica zerado (nunca foi
+// cronometrado de verdade) e a execução é atribuída ao colaborador escolhido no momento.
+app.post('/execucoes-etapa/concluir-direto', async (req, res) => {
+  const { itemPedidoId, etapaChicoteId, colaboradorId } = req.body;
+  const quantidadeProduzida = parseInt(req.body?.quantidadeProduzida);
+  if (!itemPedidoId || !etapaChicoteId || !colaboradorId) {
+    return res.status(400).json({ message: 'itemPedidoId, etapaChicoteId e colaboradorId são obrigatórios.' });
+  }
+  if (!Number.isInteger(quantidadeProduzida) || quantidadeProduzida < 0) {
+    return res.status(400).json({ message: 'Informe quantas peças foram feitas (quantidadeProduzida deve ser um inteiro maior ou igual a zero).' });
+  }
+  try {
+    const itemInfo = await db.get(
+      `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+       FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ip.id = $1`,
+      [itemPedidoId]
+    );
+    if (!itemInfo) return res.status(404).json({ message: 'Item do pedido não encontrado.' });
+
+    const jaProduzidas = await db.get(
+      `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
+       WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido'`,
+      [itemPedidoId, etapaChicoteId]
+    );
+    const qtdPedido = Number(itemInfo.quantidadepedido) || 0;
+    const somaJaProduzida = Number(jaProduzidas.total) || 0;
+    const restanteAntes = qtdPedido > 0 ? Math.max(0, qtdPedido - somaJaProduzida) : null;
+
+    const agora = formatDateToLocalISO(new Date(), 'concluir-etapa-direto');
+    const execucao = await db.get(
+      `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado, dataConclusao, quantidadeProduzida)
+       VALUES ($1, $2, $3, 'concluido', $4, 0, $4, $5) RETURNING id`,
+      [itemPedidoId, etapaChicoteId, colaboradorId, agora, quantidadeProduzida]
+    );
+
+    const restante = restanteAntes != null ? Math.max(0, restanteAntes - quantidadeProduzida) : null;
+    const etapaCompleta = restanteAntes == null || restanteAntes - quantidadeProduzida <= 0;
+    const [colaborador, etapa] = await Promise.all([
+      db.get('SELECT nome FROM colaboradores WHERE id = $1', [colaboradorId]),
+      db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [etapaChicoteId]),
+    ]);
+    await criarNotificacao({
+      tipo: 'etapa_concluida',
+      titulo: `"${etapa?.nome || 'Etapa'}" concluída pelo admin em nome de ${colaborador?.nome || 'colaborador'}${etapaCompleta ? '' : ' (parcial)'}`,
+      mensagem: `${itemInfo.empresa} — OS ${itemInfo.numeroos} · ${itemInfo.codigodesenho} — ${quantidadeProduzida} peça(s) feita(s)${etapaCompleta ? '' : `, restam ${restante}`}.`,
+      rota: '/',
+    });
+
+    await recalcularMediaSeItemCompleto(itemPedidoId);
+
+    res.status(201).json({ id: execucao.id, status: 'concluido', quantidadeProduzida, restante, etapaCompleta });
+  } catch (error) {
+    console.error('Erro ao concluir etapa direto:', error.message);
+    res.status(500).json({ message: 'Erro ao concluir etapa direto', error: error.message });
   }
 });
 
