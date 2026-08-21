@@ -2977,6 +2977,16 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       await db.run('UPDATE execucoes_etapa SET grupoExecucaoId = id WHERE id = $1', [execucao.id]);
     }
 
+    // Move o pedido pra "andamento" logo após gravar a execução, antes de qualquer
+    // efeito colateral best-effort (notificação/push/e-mail). Se algo depois disso
+    // falhar (ex: blip de conexão), a etapa fica registrada como iniciada mas o pedido
+    // já mudou de status — evita o pedido ficar preso em "novo" com produção rolando.
+    const item = itemInfo;
+    let resultadoStatus = { changes: 0 };
+    if (item) {
+      resultadoStatus = await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
+    }
+
     const [colaborador, etapa] = await Promise.all([
       db.get('SELECT nome FROM colaboradores WHERE id = $1', [colaboradorId]),
       db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [etapaChicoteId]),
@@ -2990,50 +3000,46 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       rota: '/',
     });
 
-    const item = itemInfo;
-    if (item) {
-      const resultadoStatus = await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
-      if (resultadoStatus.changes > 0) {
-        try {
-          const pedido = await db.get('SELECT * FROM pedidos WHERE id = $1', [item.pedido_id]);
-          const itensDoPedido = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [item.pedido_id]);
-          const pedidoFormatado = {
-            empresa: pedido.empresa,
-            numeroOS: pedido.numeroos,
-            dataEntrada: pedido.dataentrada,
-            previsaoEntrega: pedido.previsaoentrega,
-            responsavel: pedido.responsavel,
-            status: pedido.status,
-            inicio: converterFormatoData(pedido.inicio),
-            tempo: 0,
-            pausado: false,
-            tempoPausado: 0,
-          };
-          const itensFormatados = itensDoPedido.map((i) => ({
-            codigoDesenho: i.codigodesenho,
-            quantidadePedido: i.quantidadepedido,
-            quantidadeEntregue: i.quantidadeentregue,
-          }));
-          const emailText = montarEmail(pedidoFormatado, itensFormatados, 'Pedido movido para Em Andamento — colaborador iniciou a produção.', []);
-          const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
-          const destinatarios = rawEmailTo.split(',').map((e) => e.trim()).filter((e) => e.length > 0 && e.includes('@'));
-          for (const destinatario of destinatarios) {
-            await transporter.sendMail({
-              from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
-              to: destinatario,
-              subject: `Atualização de Pedido ${pedidoFormatado.numeroOS} - Status: andamento`,
-              text: emailText,
-            });
-          }
-          await criarNotificacao({
-            tipo: 'pedido',
-            titulo: `Pedido ${pedidoFormatado.numeroOS} em andamento`,
-            mensagem: `${pedidoFormatado.empresa} — colaborador iniciou a produção.`,
-            rota: '/',
+    if (resultadoStatus.changes > 0) {
+      try {
+        const pedido = await db.get('SELECT * FROM pedidos WHERE id = $1', [item.pedido_id]);
+        const itensDoPedido = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [item.pedido_id]);
+        const pedidoFormatado = {
+          empresa: pedido.empresa,
+          numeroOS: pedido.numeroos,
+          dataEntrada: pedido.dataentrada,
+          previsaoEntrega: pedido.previsaoentrega,
+          responsavel: pedido.responsavel,
+          status: pedido.status,
+          inicio: converterFormatoData(pedido.inicio),
+          tempo: 0,
+          pausado: false,
+          tempoPausado: 0,
+        };
+        const itensFormatados = itensDoPedido.map((i) => ({
+          codigoDesenho: i.codigodesenho,
+          quantidadePedido: i.quantidadepedido,
+          quantidadeEntregue: i.quantidadeentregue,
+        }));
+        const emailText = montarEmail(pedidoFormatado, itensFormatados, 'Pedido movido para Em Andamento — colaborador iniciou a produção.', []);
+        const rawEmailTo = (process.env.EMAIL_TO || 'danielalves@dcachicoteseletricos.com.br').replace(/\s+/g, '');
+        const destinatarios = rawEmailTo.split(',').map((e) => e.trim()).filter((e) => e.length > 0 && e.includes('@'));
+        for (const destinatario of destinatarios) {
+          await transporter.sendMail({
+            from: `"Controle de Produção" <${process.env.EMAIL_USER || 'dcashopecia@gmail.com'}>`,
+            to: destinatario,
+            subject: `Atualização de Pedido ${pedidoFormatado.numeroOS} - Status: andamento`,
+            text: emailText,
           });
-        } catch (emailError) {
-          console.error('Erro ao enviar e-mail de início de produção:', emailError.message);
         }
+        await criarNotificacao({
+          tipo: 'pedido',
+          titulo: `Pedido ${pedidoFormatado.numeroOS} em andamento`,
+          mensagem: `${pedidoFormatado.empresa} — colaborador iniciou a produção.`,
+          rota: '/',
+        });
+      } catch (emailError) {
+        console.error('Erro ao enviar e-mail de início de produção:', emailError.message);
       }
     }
 
