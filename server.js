@@ -279,6 +279,12 @@ const initializeDatabase = async () => {
         AND ex.quantidadeProduzida IS NULL
     `);
 
+    // Agrupa execuções de etapas "mescladas" (ex: dois passos simples feitos ao mesmo tempo,
+    // um único cronômetro). Todas as execuções do mesmo grupo compartilham esse valor — a
+    // primeira aponta pro próprio id, as demais apontam pro id dela. Pausar/retomar/concluir
+    // uma propaga o mesmo status/tempo/quantidade pras outras do grupo.
+    await db.run(`ALTER TABLE execucoes_etapa ADD COLUMN IF NOT EXISTS grupoExecucaoId INTEGER`);
+
     // Prioridade/ordem migrou de itens_pedidos pra pedidos (item.prioritario fica sem uso a partir daqui)
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS ordemPrioridade INTEGER`);
@@ -1169,8 +1175,13 @@ app.get('/pedidos', async (req, res) => {
       itens.filter((i) => i.chicote_id).forEach((item) => {
         const etapasDoItem = etapasChicotes.filter((e) => e.chicote_id === item.chicote_id);
         const execucoesDoItem = execucoesItens.filter((ex) => ex.item_pedido_id === item.id);
-        const temExecucaoAtiva = execucoesDoItem.some((ex) => ex.status !== 'concluido');
+        const qtd = Number(item.quantidadepedido);
         const etapasConcluidas = [];
+        // Etapas cuja quantidade produzida (soma das execuções concluídas) já bate a
+        // quantidade pedida — uma execução pausada/em andamento "órfã" nessas etapas (ex:
+        // colaborador que pausou e nunca retomou, enquanto outro já fechou a etapa) não
+        // deve contar como pendência real, senão o pedido nunca "libera" pra concluir.
+        const etapasSatisfeitas = new Set();
         let todasConcluidas = etapasDoItem.length > 0;
         let somaTempoMedio = 0;
         etapasDoItem.forEach((e) => {
@@ -1180,6 +1191,10 @@ app.get('/pedidos', async (req, res) => {
             todasConcluidas = false;
             return;
           }
+          const somaProduzida = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+          if (qtd <= 0 || somaProduzida >= qtd) {
+            etapasSatisfeitas.add(e.id);
+          }
           const tempoMedio = concluidas.reduce((soma, ex) => soma + (Number(ex.tempoacumulado) || 0), 0) / concluidas.length;
           somaTempoMedio += tempoMedio;
           etapasConcluidas.push({
@@ -1188,7 +1203,9 @@ app.get('/pedidos', async (req, res) => {
             colaboradores: [...new Set(concluidas.map((ex) => ex.colaboradornome))],
           });
         });
-        const qtd = Number(item.quantidadepedido);
+        const temExecucaoAtiva = execucoesDoItem.some(
+          (ex) => ex.status !== 'concluido' && !etapasSatisfeitas.has(ex.etapa_chicote_id)
+        );
         const tempoTotalReal = todasConcluidas && qtd > 0 ? Math.round(somaTempoMedio / qtd) : null;
         producaoPorItem.set(item.id, {
           totalEtapas: etapasDoItem.length,
@@ -2766,6 +2783,21 @@ app.get('/ordens-producao', async (req, res) => {
       [itemIds]
     );
 
+    // Nome da(s) outra(s) etapa(s) mescladas no mesmo grupo/cronômetro, pra mostrar
+    // "mesclada com X" na tela sem o front precisar cruzar isso na mão.
+    const etapaNomePorId = new Map(etapas.map((e) => [e.id, e.nome]));
+    const etapaIdsPorGrupo = new Map();
+    execucoes.forEach((ex) => {
+      if (!ex.grupoexecucaoid) return;
+      if (!etapaIdsPorGrupo.has(ex.grupoexecucaoid)) etapaIdsPorGrupo.set(ex.grupoexecucaoid, new Set());
+      etapaIdsPorGrupo.get(ex.grupoexecucaoid).add(ex.etapa_chicote_id);
+    });
+    const mescladaComDe = (ex) => {
+      if (!ex.grupoexecucaoid) return [];
+      const ids = etapaIdsPorGrupo.get(ex.grupoexecucaoid) || new Set();
+      return Array.from(ids).filter((eid) => eid !== ex.etapa_chicote_id).map((eid) => etapaNomePorId.get(eid)).filter(Boolean);
+    };
+
     const calcularExecucao = (exec) => {
       if (!exec) return null;
       const base = Math.round(Number(exec.tempoacumulado) || 0);
@@ -2775,15 +2807,16 @@ app.get('/ordens-producao', async (req, res) => {
           status: exec.status,
           tempoAcumuladoBase: base,
           referenciaInicio: exec.datapausada || exec.inicio,
+          mescladaCom: mescladaComDe(exec),
         };
       }
-      return { id: exec.id, status: exec.status, tempoAcumulado: base };
+      return { id: exec.id, status: exec.status, tempoAcumulado: base, mescladaCom: mescladaComDe(exec) };
     };
 
     const calcularExecucaoAtual = (exec) => {
       if (!exec) return null;
       const base = Math.round(Number(exec.tempoacumulado) || 0);
-      const comum = { id: exec.id, status: exec.status, colaboradorId: exec.colaborador_id, colaboradorNome: exec.colaboradornome };
+      const comum = { id: exec.id, status: exec.status, colaboradorId: exec.colaborador_id, colaboradorNome: exec.colaboradornome, mescladaCom: mescladaComDe(exec) };
       if (exec.status === 'em_andamento') {
         return { ...comum, tempoAcumuladoBase: base, referenciaInicio: exec.datapausada || exec.inicio };
       }
@@ -2869,9 +2902,12 @@ app.get('/ordens-producao', async (req, res) => {
 });
 
 app.post('/execucoes-etapa/iniciar', async (req, res) => {
-  const { itemPedidoId, etapaChicoteId, colaboradorId } = req.body;
+  const { itemPedidoId, etapaChicoteId, colaboradorId, etapaChicoteIdMesclada } = req.body;
   if (!itemPedidoId || !etapaChicoteId || !colaboradorId) {
     return res.status(400).json({ message: 'itemPedidoId, etapaChicoteId e colaboradorId são obrigatórios.' });
+  }
+  if (etapaChicoteIdMesclada && Number(etapaChicoteIdMesclada) === Number(etapaChicoteId)) {
+    return res.status(400).json({ message: 'Selecione uma etapa diferente pra mesclar.' });
   }
   try {
     const emAndamento = await db.get(
@@ -2887,7 +2923,7 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
     // Não há mais bloqueio por causa de outro colaborador já estar/ter estado nessa etapa.
 
     const itemInfo = await db.get(
-      `SELECT ip.id, ip.pedido_id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+      `SELECT ip.id, ip.pedido_id, ip.codigoDesenho, ip.quantidadePedido, ip.chicote_id, p.empresa, p.numeroOS
        FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
        WHERE ip.id = $1`,
       [itemPedidoId]
@@ -2895,15 +2931,33 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
     if (!itemInfo) {
       return res.status(404).json({ message: 'Item do pedido não encontrado.' });
     }
-
-    const produzidas = await db.get(
-      `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
-       WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido'`,
-      [itemPedidoId, etapaChicoteId]
-    );
     const qtdPedido = Number(itemInfo.quantidadepedido) || 0;
-    if (qtdPedido > 0 && Number(produzidas.total) >= qtdPedido) {
+
+    const checarQuantidadeDisponivel = async (etapaId) => {
+      const produzidas = await db.get(
+        `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
+         WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido'`,
+        [itemPedidoId, etapaId]
+      );
+      return !(qtdPedido > 0 && Number(produzidas.total) >= qtdPedido);
+    };
+
+    if (!(await checarQuantidadeDisponivel(etapaChicoteId))) {
       return res.status(409).json({ message: 'Essa etapa já produziu a quantidade total desse item.' });
+    }
+
+    let etapaMesclada = null;
+    if (etapaChicoteIdMesclada) {
+      etapaMesclada = await db.get('SELECT id, chicote_id, nome FROM etapas_chicote WHERE id = $1', [etapaChicoteIdMesclada]);
+      if (!etapaMesclada) {
+        return res.status(404).json({ message: 'Etapa pra mesclar não encontrada.' });
+      }
+      if (etapaMesclada.chicote_id !== itemInfo.chicote_id) {
+        return res.status(400).json({ message: 'A etapa mesclada precisa ser do mesmo chicote.' });
+      }
+      if (!(await checarQuantidadeDisponivel(etapaChicoteIdMesclada))) {
+        return res.status(409).json({ message: 'A etapa mesclada já produziu a quantidade total desse item.' });
+      }
     }
 
     const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
@@ -2913,13 +2967,25 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       [itemPedidoId, etapaChicoteId, colaboradorId, agora]
     );
 
+    let execucaoMesclada = null;
+    if (etapaMesclada) {
+      execucaoMesclada = await db.get(
+        `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado, grupoExecucaoId)
+         VALUES ($1, $2, $3, 'em_andamento', $4, 0, $5) RETURNING id`,
+        [itemPedidoId, etapaChicoteIdMesclada, colaboradorId, agora, execucao.id]
+      );
+      await db.run('UPDATE execucoes_etapa SET grupoExecucaoId = id WHERE id = $1', [execucao.id]);
+    }
+
     const [colaborador, etapa] = await Promise.all([
       db.get('SELECT nome FROM colaboradores WHERE id = $1', [colaboradorId]),
       db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [etapaChicoteId]),
     ]);
     await criarNotificacao({
       tipo: 'etapa_iniciada',
-      titulo: `${colaborador?.nome || 'Colaborador'} iniciou "${etapa?.nome || 'etapa'}"`,
+      titulo: etapaMesclada
+        ? `${colaborador?.nome || 'Colaborador'} iniciou "${etapa?.nome || 'etapa'}" mesclada com "${etapaMesclada.nome}"`
+        : `${colaborador?.nome || 'Colaborador'} iniciou "${etapa?.nome || 'etapa'}"`,
       mensagem: `${itemInfo.empresa} — OS ${itemInfo.numeroos} · ${itemInfo.codigodesenho}`,
       rota: '/',
     });
@@ -2971,7 +3037,13 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       }
     }
 
-    res.status(201).json({ id: execucao.id, status: 'em_andamento', tempoAcumuladoBase: 0, referenciaInicio: agora });
+    res.status(201).json({
+      id: execucao.id,
+      status: 'em_andamento',
+      tempoAcumuladoBase: 0,
+      referenciaInicio: agora,
+      idMesclada: execucaoMesclada?.id ?? null,
+    });
   } catch (error) {
     console.error('Erro ao iniciar etapa:', error.message);
     res.status(500).json({ message: 'Erro ao iniciar etapa', error: error.message });
@@ -2989,6 +3061,19 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
     const agora = formatDateToLocalISO(new Date(), 'pausar-etapa');
     const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
     await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, agora, id]);
+
+    // Etapa mesclada usa o mesmo cronômetro — pausa junto.
+    if (exec.grupoexecucaoid) {
+      const irmas = await db.all(
+        "SELECT * FROM execucoes_etapa WHERE grupoExecucaoId = $1 AND id != $2 AND status = 'em_andamento'",
+        [exec.grupoexecucaoid, id]
+      );
+      for (const irma of irmas) {
+        const tempoIrma = (Number(irma.tempoacumulado) || 0) + calcularTempoSegundos(irma.datapausada || irma.inicio, agora);
+        await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [tempoIrma, agora, irma.id]);
+      }
+    }
+
     res.json({ id, status: 'pausado', tempoAcumulado: Math.round(novoTempo) });
   } catch (error) {
     console.error('Erro ao pausar etapa:', error.message);
@@ -3013,6 +3098,15 @@ app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
     }
     const agora = formatDateToLocalISO(new Date(), 'retomar-etapa');
     await db.run("UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE id = $2", [agora, id]);
+
+    // Etapa mesclada retoma junto, no mesmo instante.
+    if (exec.grupoexecucaoid) {
+      await db.run(
+        "UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE grupoExecucaoId = $2 AND id != $3 AND status = 'pausado'",
+        [agora, exec.grupoexecucaoid, id]
+      );
+    }
+
     res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
   } catch (error) {
     console.error('Erro ao retomar etapa:', error.message);
@@ -3033,53 +3127,88 @@ app.put('/execucoes-etapa/:id/concluir', async (req, res) => {
       return res.status(400).json({ message: 'Essa etapa já foi concluída.' });
     }
 
-    const itemInfo = await db.get(
-      `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
-       FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
-       WHERE ip.id = $1`,
-      [exec.item_pedido_id]
-    );
-    const jaProduzidas = await db.get(
-      `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
-       WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido' AND id != $3`,
-      [exec.item_pedido_id, exec.etapa_chicote_id, id]
-    );
-    const qtdPedido = Number(itemInfo?.quantidadepedido) || 0;
-    const somaJaProduzida = Number(jaProduzidas.total) || 0;
-    // Não bloqueia por quantidade: várias pessoas costumam trabalhar na mesma etapa ao
-    // mesmo tempo, e quem chega depois (com a etapa já batendo o total por causa de outra
-    // execução concluída nesse meio-tempo) ainda precisa conseguir concluir a própria
-    // execução — só não conta mais nada acima do total pra "quantidadeRestante" no relatório.
-    const restanteAntes = qtdPedido > 0 ? Math.max(0, qtdPedido - somaJaProduzida) : null;
-
+    // Etapa mesclada fecha junto, com a mesma quantidade (cronômetro único = mesma peça
+    // avançando as duas etapas ao mesmo tempo). Cada uma mantém sua própria contagem de
+    // quantidade produzida/restante, então processa cada execução do grupo separadamente.
+    const irmas = exec.grupoexecucaoid
+      ? await db.all(
+          "SELECT * FROM execucoes_etapa WHERE grupoExecucaoId = $1 AND id != $2 AND status != 'concluido'",
+          [exec.grupoexecucaoid, id]
+        )
+      : [];
     const agora = formatDateToLocalISO(new Date(), 'concluir-etapa');
-    let tempoFinal = Number(exec.tempoacumulado) || 0;
-    if (exec.status === 'em_andamento') {
-      tempoFinal += calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
-    }
-    await db.run(
-      "UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2, quantidadeProduzida = $3 WHERE id = $4",
-      [tempoFinal, agora, quantidadeProduzida, id]
-    );
 
-    const restante = restanteAntes != null ? Math.max(0, restanteAntes - quantidadeProduzida) : null;
-    const etapaCompleta = restanteAntes == null || restanteAntes - quantidadeProduzida <= 0;
-    const [colaborador, etapa] = await Promise.all([
-      db.get('SELECT nome FROM colaboradores WHERE id = $1', [exec.colaborador_id]),
-      db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [exec.etapa_chicote_id]),
-    ]);
+    const fecharExecucao = async (execAtual) => {
+      const itemInfo = await db.get(
+        `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+         FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
+         WHERE ip.id = $1`,
+        [execAtual.item_pedido_id]
+      );
+      const jaProduzidas = await db.get(
+        `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
+         WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido' AND id != $3`,
+        [execAtual.item_pedido_id, execAtual.etapa_chicote_id, execAtual.id]
+      );
+      const qtdPedido = Number(itemInfo?.quantidadepedido) || 0;
+      const somaJaProduzida = Number(jaProduzidas.total) || 0;
+      // Não bloqueia por quantidade: várias pessoas costumam trabalhar na mesma etapa ao
+      // mesmo tempo, e quem chega depois (com a etapa já batendo o total por causa de outra
+      // execução concluída nesse meio-tempo) ainda precisa conseguir concluir a própria
+      // execução — só não conta mais nada acima do total pra "quantidadeRestante" no relatório.
+      const restanteAntes = qtdPedido > 0 ? Math.max(0, qtdPedido - somaJaProduzida) : null;
+
+      let tempoFinal = Number(execAtual.tempoacumulado) || 0;
+      if (execAtual.status === 'em_andamento') {
+        tempoFinal += calcularTempoSegundos(execAtual.datapausada || execAtual.inicio, agora);
+      }
+      await db.run(
+        "UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2, quantidadeProduzida = $3 WHERE id = $4",
+        [tempoFinal, agora, quantidadeProduzida, execAtual.id]
+      );
+
+      const restante = restanteAntes != null ? Math.max(0, restanteAntes - quantidadeProduzida) : null;
+      const etapaCompleta = restanteAntes == null || restanteAntes - quantidadeProduzida <= 0;
+      return { tempoFinal, restante, etapaCompleta, itemInfo };
+    };
+
+    const principal = await fecharExecucao(exec);
+    const secundarias = [];
+    for (const irma of irmas) {
+      secundarias.push({ exec: irma, resultado: await fecharExecucao(irma) });
+    }
+
+    const nomesEtapas = await Promise.all(
+      [exec, ...irmas].map((e) => db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [e.etapa_chicote_id]))
+    );
+    const colaborador = await db.get('SELECT nome FROM colaboradores WHERE id = $1', [exec.colaborador_id]);
+    const nomeEtapaTitulo = nomesEtapas.map((e) => e?.nome || 'etapa').join(' + ');
     await criarNotificacao({
       tipo: 'etapa_concluida',
-      titulo: `${colaborador?.nome || 'Colaborador'} concluiu "${etapa?.nome || 'etapa'}"${etapaCompleta ? '' : ' (parcial)'}`,
-      mensagem: itemInfo
-        ? `${itemInfo.empresa} — OS ${itemInfo.numeroos} · ${itemInfo.codigodesenho} — ${quantidadeProduzida} peça(s) feita(s)${etapaCompleta ? '' : `, restam ${restante}`}.`
+      titulo: `${colaborador?.nome || 'Colaborador'} concluiu "${nomeEtapaTitulo}"${principal.etapaCompleta ? '' : ' (parcial)'}`,
+      mensagem: principal.itemInfo
+        ? `${principal.itemInfo.empresa} — OS ${principal.itemInfo.numeroos} · ${principal.itemInfo.codigodesenho} — ${quantidadeProduzida} peça(s) feita(s)${principal.etapaCompleta ? '' : `, restam ${principal.restante}`}.`
         : `${quantidadeProduzida} peça(s) feita(s).`,
       rota: '/',
     });
 
     await recalcularMediaSeItemCompleto(exec.item_pedido_id);
 
-    res.json({ id, status: 'concluido', tempoAcumulado: Math.round(tempoFinal), quantidadeProduzida, restante, etapaCompleta });
+    res.json({
+      id,
+      status: 'concluido',
+      tempoAcumulado: Math.round(principal.tempoFinal),
+      quantidadeProduzida,
+      restante: principal.restante,
+      etapaCompleta: principal.etapaCompleta,
+      mescladas: secundarias.map((s) => ({
+        id: s.exec.id,
+        etapaChicoteId: s.exec.etapa_chicote_id,
+        tempoAcumulado: Math.round(s.resultado.tempoFinal),
+        restante: s.resultado.restante,
+        etapaCompleta: s.resultado.etapaCompleta,
+      })),
+    });
   } catch (error) {
     console.error('Erro ao concluir etapa:', error.message);
     res.status(500).json({ message: 'Erro ao concluir etapa', error: error.message });
@@ -3150,7 +3279,12 @@ app.put('/execucoes-etapa/:id/zerar', async (req, res) => {
   try {
     const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
     if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
-    await db.run('DELETE FROM execucoes_etapa WHERE id = $1', [id]);
+    // Zera o grupo inteiro junto — não faz sentido apagar só metade de uma etapa mesclada.
+    if (exec.grupoexecucaoid) {
+      await db.run('DELETE FROM execucoes_etapa WHERE grupoExecucaoId = $1', [exec.grupoexecucaoid]);
+    } else {
+      await db.run('DELETE FROM execucoes_etapa WHERE id = $1', [id]);
+    }
     res.json({ id, removida: true });
   } catch (error) {
     console.error('Erro ao zerar tempo da execução:', error.message);
@@ -3181,6 +3315,15 @@ app.put('/execucoes-etapa/:id/reabrir', async (req, res) => {
       "UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1, dataConclusao = NULL, quantidadeProduzida = NULL WHERE id = $2",
       [agora, id]
     );
+
+    // Reabre a etapa mesclada junto, senão o grupo fica com uma perna concluída e outra não.
+    if (exec.grupoexecucaoid) {
+      await db.run(
+        "UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1, dataConclusao = NULL, quantidadeProduzida = NULL WHERE grupoExecucaoId = $2 AND id != $3 AND status = 'concluido'",
+        [agora, exec.grupoexecucaoid, id]
+      );
+    }
+
     res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
   } catch (error) {
     console.error('Erro ao retomar etapa concluída:', error.message);
