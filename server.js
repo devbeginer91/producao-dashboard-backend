@@ -3800,6 +3800,28 @@ app.put('/pedidos/:id', async (req, res) => {
           await client.query(historicoSql, [id, item.id, quantidadeEntregue, dataEdicao]);
         }
       }
+
+      // Concluir o pedido não pode deixar etapa pra trás: fecha (com o tempo acumulado até
+      // agora) qualquer execução ainda em_andamento/pausada dos itens desse pedido — senão
+      // ela vira órfã, some do "Acompanhar Produção" (que só lista pedidos novo/andamento) e
+      // fica com o cronômetro rodando pra sempre no painel "Em Execução Agora".
+      const itemIds = itensResult.rows.map((item) => item.id);
+      if (itemIds.length > 0) {
+        const execucoesAbertas = await client.query(
+          "SELECT * FROM execucoes_etapa WHERE item_pedido_id = ANY($1::int[]) AND status != 'concluido'",
+          [itemIds]
+        );
+        for (const exec of execucoesAbertas.rows) {
+          let tempoFinal = Number(exec.tempoacumulado) || 0;
+          if (exec.status === 'em_andamento') {
+            tempoFinal += calcularTempoSegundos(exec.datapausada || exec.inicio, dataEdicao);
+          }
+          await client.query(
+            "UPDATE execucoes_etapa SET status = 'concluido', tempoAcumulado = $1, dataConclusao = $2, quantidadeProduzida = COALESCE(quantidadeProduzida, 0) WHERE id = $3",
+            [tempoFinal, dataEdicao, exec.id]
+          );
+        }
+      }
     }
 
     if (itens && Array.isArray(itens)) {
