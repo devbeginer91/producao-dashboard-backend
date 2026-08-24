@@ -3235,7 +3235,7 @@ app.post('/execucoes-etapa/concluir-direto', async (req, res) => {
   }
   try {
     const itemInfo = await db.get(
-      `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, p.empresa, p.numeroOS
+      `SELECT ip.id, ip.codigoDesenho, ip.quantidadePedido, ip.pedido_id, p.empresa, p.numeroOS
        FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
        WHERE ip.id = $1`,
       [itemPedidoId]
@@ -3257,6 +3257,10 @@ app.post('/execucoes-etapa/concluir-direto', async (req, res) => {
        VALUES ($1, $2, $3, 'concluido', $4, 0, $4, $5) RETURNING id`,
       [itemPedidoId, etapaChicoteId, colaboradorId, agora, quantidadeProduzida]
     );
+
+    // Etapa concluída direto (nunca passou por /iniciar) também precisa levar o pedido pra
+    // "andamento" — senão ele fica preso em "novo" mesmo com produção já concluída nele.
+    await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [itemInfo.pedido_id, agora]);
 
     const restante = restanteAntes != null ? Math.max(0, restanteAntes - quantidadeProduzida) : null;
     const etapaCompleta = restanteAntes == null || restanteAntes - quantidadeProduzida <= 0;
