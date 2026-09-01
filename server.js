@@ -3339,6 +3339,16 @@ app.put('/execucoes-etapa/:id/reabrir', async (req, res) => {
       );
     }
 
+    // Reabrir uma etapa é retomar produção — o pedido não pode ficar preso em "novo"/"concluido"
+    // com uma etapa rodando de novo (foi exatamente isso que aconteceu na OS 937: reabriu a
+    // etapa mas o pedido continuou "novo" porque só /iniciar e /concluir-direto moviam pra
+    // "andamento").
+    await db.run(
+      `UPDATE pedidos SET status = 'andamento'
+       WHERE id = (SELECT pedido_id FROM itens_pedidos WHERE id = $1) AND status != 'andamento'`,
+      [exec.item_pedido_id]
+    );
+
     res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
   } catch (error) {
     console.error('Erro ao retomar etapa concluída:', error.message);
