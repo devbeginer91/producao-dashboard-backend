@@ -2469,7 +2469,7 @@ app.get('/chicotes/:id/relatorio-tempos', async (req, res) => {
           numeroOS: item.numeroos,
           statusPedido: item.status,
           quantidadePedido: qtd,
-          quantidadeProduzida: quantidadeProduzidaTotal,
+          quantidadeProduzida: Math.min(quantidadeProduzidaTotal, qtd),
           tempoRealSegundos,
           dataConclusao: conclusaoMaisRecente,
           classificacao,
@@ -2847,7 +2847,12 @@ app.get('/ordens-producao', async (req, res) => {
               );
               const execucaoMaisRecente = execucoesDaEtapa[0];
               const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
-              const quantidadeProduzida = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              const quantidadeProduzidaBruta = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              // Vários colaboradores podem concluir a mesma etapa (dividindo o lote ou, por
+              // engano, registrando a quantidade total de novo). O total exibido/usado pro
+              // "restante" nunca passa da quantidade pedida do item, senão duas pessoas
+              // registrando "20" numa etapa de 20 peças mostraria 40/20.
+              const quantidadeProduzida = qtd > 0 ? Math.min(quantidadeProduzidaBruta, qtd) : quantidadeProduzidaBruta;
               const quantidadeRestante = qtd > 0 ? Math.max(0, qtd - quantidadeProduzida) : null;
               const concluida = qtd > 0 ? quantidadeProduzida >= qtd : concluidas.length > 0;
               // Tempo da etapa = média entre os colaboradores que a concluíram
@@ -3460,7 +3465,10 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 .sort((a, b) => b.id - a.id);
               const execucaoMaisRecente = execucoesDaEtapa[0];
               const concluidas = execucoesDaEtapa.filter((ex) => ex.status === 'concluido');
-              const quantidadeProduzida = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              const quantidadeProduzidaBruta = concluidas.reduce((soma, ex) => soma + (Number(ex.quantidadeproduzida) || 0), 0);
+              // Ver comentário equivalente no /ordens-producao: total nunca passa da quantidade
+              // pedida, mesmo que dois colaboradores tenham registrado a quantidade cheia cada um.
+              const quantidadeProduzida = qtd > 0 ? Math.min(quantidadeProduzidaBruta, qtd) : quantidadeProduzidaBruta;
               const quantidadeRestante = qtd > 0 ? Math.max(0, qtd - quantidadeProduzida) : null;
               const concluida = qtd > 0 ? quantidadeProduzida >= qtd : concluidas.length > 0;
               // Tempo da etapa = média entre os colaboradores que a concluíram.
