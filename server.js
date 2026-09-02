@@ -3356,6 +3356,33 @@ app.put('/execucoes-etapa/:id/reabrir', async (req, res) => {
   }
 });
 
+// Corrige a quantidade produzida registrada numa execução já concluída — sem apagar o tempo
+// acumulado nem o registro em si (diferente de "zerar", que apaga tudo). Usado quando um
+// colaborador concluiu a etapa com a quantidade errada (etapa não estava de fato pronta): a
+// soma de quantidadeProduzida das execuções concluídas é o que trava /iniciar pra outro
+// colaborador, então corrigir aqui pra baixo libera a etapa sem jogar fora o tempo que já foi
+// gasto de verdade (ele continua contando nos relatórios de tempo do colaborador).
+app.put('/execucoes-etapa/:id/corrigir-quantidade', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const quantidadeProduzida = parseInt(req.body?.quantidadeProduzida);
+  if (!Number.isInteger(quantidadeProduzida) || quantidadeProduzida < 0) {
+    return res.status(400).json({ message: 'Informe a quantidade correta (inteiro maior ou igual a zero).' });
+  }
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status !== 'concluido') {
+      return res.status(400).json({ message: 'Só é possível corrigir a quantidade de uma execução concluída.' });
+    }
+    await db.run('UPDATE execucoes_etapa SET quantidadeProduzida = $1 WHERE id = $2', [quantidadeProduzida, id]);
+    await recalcularMediaSeItemCompleto(exec.item_pedido_id);
+    res.json({ id, quantidadeProduzida });
+  } catch (error) {
+    console.error('Erro ao corrigir quantidade produzida:', error.message);
+    res.status(500).json({ message: 'Erro ao corrigir quantidade produzida', error: error.message });
+  }
+});
+
 app.get('/execucoes-etapa/ativas', async (req, res) => {
   try {
     const rows = await db.all(`
