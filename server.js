@@ -3419,6 +3419,50 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
   }
 });
 
+// Lista TODAS as execuções em andamento/pausadas do sistema, com LEFT JOIN em tudo — ao
+// contrário de /execucoes-etapa/ativas (que usa JOIN normal e some com a linha se a etapa, o
+// item ou o pedido não existir mais), essa rota é feita pra achar execuções órfãs: quando o
+// vínculo de chicote de um item é corrigido/trocado e a etapa antiga é apagada, a execução que
+// estava em andamento nela fica "presa" — trava o colaborador de iniciar qualquer coisa nova e
+// não aparece em nenhuma árvore normal (OS > item > etapa) pra alguém cancelar. Aqui ela some
+// como "etapa removida"/"pedido não encontrado" em vez de simplesmente desaparecer.
+app.get('/execucoes-etapa/abertas', async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT ex.id, ex.status, ex.tempoAcumulado, ex.inicio, ex.dataPausada,
+             p.id AS pedidoId, p.empresa, p.numeroOS,
+             ip.codigoDesenho,
+             ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
+             col.id AS colaboradorId, col.nome AS colaboradorNome
+      FROM execucoes_etapa ex
+      LEFT JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
+      LEFT JOIN pedidos p ON p.id = ip.pedido_id
+      LEFT JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
+      LEFT JOIN colaboradores col ON col.id = ex.colaborador_id
+      WHERE ex.status IN ('em_andamento', 'pausado')
+      ORDER BY ex.status = 'em_andamento' DESC, ex.inicio ASC
+    `);
+    const resultado = rows.map((r) => ({
+      id: r.id,
+      status: r.status,
+      colaboradorId: r.colaboradorid,
+      colaboradorNome: r.colaboradornome || '(colaborador removido)',
+      empresa: r.empresa || null,
+      numeroOS: r.numeroos || null,
+      codigoDesenho: r.codigodesenho || null,
+      etapaNome: r.etapanome || null,
+      etapaOrdem: r.etapaordem ?? null,
+      orfao: !r.etapanome || !r.empresa,
+      tempoAcumuladoBase: Math.round(Number(r.tempoacumulado) || 0),
+      referenciaInicio: r.datapausada || r.inicio,
+    }));
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro ao listar execuções abertas:', error.message);
+    res.status(500).json({ message: 'Erro ao listar execuções abertas', error: error.message });
+  }
+});
+
 app.get('/ordens-producao/monitor', async (req, res) => {
   try {
     const pedidos = await db.all(`
