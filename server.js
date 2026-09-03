@@ -1402,6 +1402,65 @@ app.put('/itens-pedidos/:id/faturar', async (req, res) => {
   }
 });
 
+// Fatura de uma vez o saldo pendente de TODOS os itens do pedido que já têm valor
+// unitário cadastrado e saldo entregue não faturado — itens sem valor ou sem saldo são
+// simplesmente pulados (não bloqueiam os demais). Mesma regra de negócio de
+// PUT /itens-pedidos/:id/faturar, só que em lote e numa única transação.
+app.put('/pedidos/:id/faturar', async (req, res) => {
+  const pedidoId = parseInt(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const itensResult = await client.query('SELECT * FROM itens_pedidos WHERE pedido_id = $1 FOR UPDATE', [pedidoId]);
+    const itens = itensResult.rows;
+    if (itens.length === 0) {
+      throw Object.assign(new Error('Pedido não encontrado ou sem itens'), { status: 404 });
+    }
+
+    const dataFaturamento = formatDateToLocalISO(new Date(), 'faturar-pedido');
+    const itensFaturados = [];
+
+    for (const item of itens) {
+      if (item.valorunitario === null || item.valorunitario === undefined) continue;
+      const quantidadeFaturadaAtual = item.quantidadefaturada || 0;
+      const saldoFaturavel = Number(item.quantidadeentregue || 0) - quantidadeFaturadaAtual;
+      if (saldoFaturavel <= 0) continue;
+
+      const valorFaturadoEvento = Number(item.valorunitario) * saldoFaturavel;
+      const novaQuantidadeFaturada = quantidadeFaturadaAtual + saldoFaturavel;
+      const novoValorFaturadoTotal = Number(item.valorfaturado || 0) + valorFaturadoEvento;
+      const totalmenteFaturado = novaQuantidadeFaturada >= Number(item.quantidadepedido);
+
+      await client.query(
+        `INSERT INTO historico_faturamentos (item_id, quantidadeFaturada, valorFaturado, dataFaturamento)
+         VALUES ($1, $2, $3, $4)`,
+        [item.id, saldoFaturavel, valorFaturadoEvento, dataFaturamento]
+      );
+      await client.query(
+        `UPDATE itens_pedidos
+         SET quantidadeFaturada = $1, valorFaturado = $2, dataFaturamento = $3, faturado = $4
+         WHERE id = $5`,
+        [novaQuantidadeFaturada, novoValorFaturadoTotal, dataFaturamento, totalmenteFaturado ? 1 : 0, item.id]
+      );
+      itensFaturados.push(item.id);
+    }
+
+    if (itensFaturados.length === 0) {
+      throw Object.assign(new Error('Não há itens prontos pra faturar nessa OS'), { status: 400 });
+    }
+
+    await client.query('COMMIT');
+    res.json({ itensFaturados });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao faturar pedido:', error.message);
+    res.status(error.status || 500).json({ message: error.message || 'Erro ao faturar pedido' });
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/financeiro/relatorio', async (req, res) => {
   try {
     const { cliente, inicio, fim } = req.query;
