@@ -2914,12 +2914,24 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
   if (etapaChicoteIdMesclada && Number(etapaChicoteIdMesclada) === Number(etapaChicoteId)) {
     return res.status(400).json({ message: 'Selecione uma etapa diferente pra mesclar.' });
   }
+  const client = await pool.connect();
+  let execucao, execucaoMesclada = null, etapaMesclada = null, itemInfo, agora, resultadoStatusChanges = 0;
   try {
-    const emAndamento = await db.get(
+    await client.query('BEGIN');
+    // Trava por colaborador dentro da transação: serializa cliques duplos/retries de rede que
+    // mandam dois /iniciar quase juntos pro mesmo colaborador. Sem isso, as duas requisições
+    // passam pela checagem de "já tem etapa em andamento" antes de qualquer uma ter inserido,
+    // e criam duas execuções em_andamento ao mesmo tempo pra mesma pessoa — foi o que aconteceu
+    // com o Ivandro na OS 968: ele pausou uma das duas gêmeas, e a outra (0s) ficou esquecida
+    // em_andamento, bloqueando ele de iniciar qualquer coisa nova sem aparecer em lugar nenhum.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [Number(colaboradorId)]);
+
+    const emAndamentoResult = await client.query(
       "SELECT id FROM execucoes_etapa WHERE colaborador_id = $1 AND status = 'em_andamento'",
       [colaboradorId]
     );
-    if (emAndamento) {
+    if (emAndamentoResult.rows[0]) {
+      await client.query('ROLLBACK');
       return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de iniciar essa.' });
     }
 
@@ -2927,71 +2939,91 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
     // registrando seu próprio tempo (o tempo da etapa vira a média entre eles).
     // Não há mais bloqueio por causa de outro colaborador já estar/ter estado nessa etapa.
 
-    const itemInfo = await db.get(
+    const itemInfoResult = await client.query(
       `SELECT ip.id, ip.pedido_id, ip.codigoDesenho, ip.quantidadePedido, ip.chicote_id, p.empresa, p.numeroOS
        FROM itens_pedidos ip JOIN pedidos p ON p.id = ip.pedido_id
        WHERE ip.id = $1`,
       [itemPedidoId]
     );
+    itemInfo = itemInfoResult.rows[0];
     if (!itemInfo) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Item do pedido não encontrado.' });
     }
     const qtdPedido = Number(itemInfo.quantidadepedido) || 0;
 
     const checarQuantidadeDisponivel = async (etapaId) => {
-      const produzidas = await db.get(
+      const produzidasResult = await client.query(
         `SELECT COALESCE(SUM(quantidadeProduzida), 0) AS total FROM execucoes_etapa
          WHERE item_pedido_id = $1 AND etapa_chicote_id = $2 AND status = 'concluido'`,
         [itemPedidoId, etapaId]
       );
-      return !(qtdPedido > 0 && Number(produzidas.total) >= qtdPedido);
+      return !(qtdPedido > 0 && Number(produzidasResult.rows[0].total) >= qtdPedido);
     };
 
     if (!(await checarQuantidadeDisponivel(etapaChicoteId))) {
+      await client.query('ROLLBACK');
       return res.status(409).json({ message: 'Essa etapa já produziu a quantidade total desse item.' });
     }
 
-    let etapaMesclada = null;
     if (etapaChicoteIdMesclada) {
-      etapaMesclada = await db.get('SELECT id, chicote_id, nome FROM etapas_chicote WHERE id = $1', [etapaChicoteIdMesclada]);
+      const etapaMescladaResult = await client.query('SELECT id, chicote_id, nome FROM etapas_chicote WHERE id = $1', [etapaChicoteIdMesclada]);
+      etapaMesclada = etapaMescladaResult.rows[0];
       if (!etapaMesclada) {
+        await client.query('ROLLBACK');
         return res.status(404).json({ message: 'Etapa pra mesclar não encontrada.' });
       }
       if (etapaMesclada.chicote_id !== itemInfo.chicote_id) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ message: 'A etapa mesclada precisa ser do mesmo chicote.' });
       }
       if (!(await checarQuantidadeDisponivel(etapaChicoteIdMesclada))) {
+        await client.query('ROLLBACK');
         return res.status(409).json({ message: 'A etapa mesclada já produziu a quantidade total desse item.' });
       }
     }
 
-    const agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
-    const execucao = await db.get(
+    agora = formatDateToLocalISO(new Date(), 'iniciar-etapa');
+    const execucaoResult = await client.query(
       `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado)
        VALUES ($1, $2, $3, 'em_andamento', $4, 0) RETURNING id`,
       [itemPedidoId, etapaChicoteId, colaboradorId, agora]
     );
+    execucao = execucaoResult.rows[0];
 
-    let execucaoMesclada = null;
     if (etapaMesclada) {
-      execucaoMesclada = await db.get(
+      const execucaoMescladaResult = await client.query(
         `INSERT INTO execucoes_etapa (item_pedido_id, etapa_chicote_id, colaborador_id, status, inicio, tempoAcumulado, grupoExecucaoId)
          VALUES ($1, $2, $3, 'em_andamento', $4, 0, $5) RETURNING id`,
         [itemPedidoId, etapaChicoteIdMesclada, colaboradorId, agora, execucao.id]
       );
-      await db.run('UPDATE execucoes_etapa SET grupoExecucaoId = id WHERE id = $1', [execucao.id]);
+      execucaoMesclada = execucaoMescladaResult.rows[0];
+      await client.query('UPDATE execucoes_etapa SET grupoExecucaoId = id WHERE id = $1', [execucao.id]);
     }
 
     // Move o pedido pra "andamento" logo após gravar a execução, antes de qualquer
     // efeito colateral best-effort (notificação/push/e-mail). Se algo depois disso
     // falhar (ex: blip de conexão), a etapa fica registrada como iniciada mas o pedido
     // já mudou de status — evita o pedido ficar preso em "novo" com produção rolando.
-    const item = itemInfo;
-    let resultadoStatus = { changes: 0 };
-    if (item) {
-      resultadoStatus = await db.run("UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'", [item.pedido_id, agora]);
-    }
+    const statusUpdateResult = await client.query(
+      "UPDATE pedidos SET status = 'andamento', inicio = $2 WHERE id = $1 AND status = 'novo'",
+      [itemInfo.pedido_id, agora]
+    );
+    resultadoStatusChanges = statusUpdateResult.rowCount;
 
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Erro ao iniciar etapa:', error.message);
+    return res.status(500).json({ message: 'Erro ao iniciar etapa', error: error.message });
+  } finally {
+    client.release();
+  }
+
+  // Efeitos colaterais best-effort (notificação/push/e-mail) — fora da transação de propósito,
+  // já commitada acima, então um erro aqui não desfaz a execução nem o status do pedido.
+  const item = itemInfo;
+  try {
     const [colaborador, etapa] = await Promise.all([
       db.get('SELECT nome FROM colaboradores WHERE id = $1', [colaboradorId]),
       db.get('SELECT nome FROM etapas_chicote WHERE id = $1', [etapaChicoteId]),
@@ -3005,7 +3037,7 @@ app.post('/execucoes-etapa/iniciar', async (req, res) => {
       rota: '/',
     });
 
-    if (resultadoStatus.changes > 0) {
+    if (resultadoStatusChanges > 0) {
       try {
         const pedido = await db.get('SELECT * FROM pedidos WHERE id = $1', [item.pedido_id]);
         const itensDoPedido = await db.all('SELECT * FROM itens_pedidos WHERE pedido_id = $1', [item.pedido_id]);
@@ -3094,34 +3126,50 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
 
 app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
   const id = parseInt(req.params.id);
+  const client = await pool.connect();
   try {
-    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
-    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    await client.query('BEGIN');
+    const execResult = await client.query('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    const exec = execResult.rows[0];
+    if (!exec) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Execução não encontrada.' });
+    }
     if (exec.status !== 'pausado') {
+      await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Essa etapa não está pausada.' });
     }
-    const emAndamento = await db.get(
+    // Mesma trava do /iniciar: serializa retomadas concorrentes do mesmo colaborador pra não
+    // criar duas execuções em_andamento ao mesmo tempo (ex: retomar duas etapas pausadas quase
+    // junto).
+    await client.query('SELECT pg_advisory_xact_lock($1)', [Number(exec.colaborador_id)]);
+    const emAndamentoResult = await client.query(
       "SELECT id FROM execucoes_etapa WHERE colaborador_id = $1 AND status = 'em_andamento'",
       [exec.colaborador_id]
     );
-    if (emAndamento) {
+    if (emAndamentoResult.rows[0]) {
+      await client.query('ROLLBACK');
       return res.status(409).json({ message: 'Você já está executando outra etapa. Pause ou conclua antes de retomar essa.' });
     }
     const agora = formatDateToLocalISO(new Date(), 'retomar-etapa');
-    await db.run("UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE id = $2", [agora, id]);
+    await client.query("UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE id = $2", [agora, id]);
 
     // Etapa mesclada retoma junto, no mesmo instante.
     if (exec.grupoexecucaoid) {
-      await db.run(
+      await client.query(
         "UPDATE execucoes_etapa SET status = 'em_andamento', dataPausada = $1 WHERE grupoExecucaoId = $2 AND id != $3 AND status = 'pausado'",
         [agora, exec.grupoexecucaoid, id]
       );
     }
 
+    await client.query('COMMIT');
     res.json({ id, status: 'em_andamento', tempoAcumuladoBase: Math.round(Number(exec.tempoacumulado) || 0), referenciaInicio: agora });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Erro ao retomar etapa:', error.message);
     res.status(500).json({ message: 'Erro ao retomar etapa', error: error.message });
+  } finally {
+    client.release();
   }
 });
 
