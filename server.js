@@ -3610,7 +3610,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
     const chicoteTempoIdealMap = new Map(chicotes.map((c) => [c.id, c.tempoideal]));
 
     const etapas = await db.all(
-      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, colaboradores, instrucoes FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
+      'SELECT id, chicote_id, ordem, nome, setor, quemTexto, colaboradores, instrucoes, tempoIdeal FROM etapas_chicote WHERE chicote_id = ANY($1::int[]) ORDER BY ordem',
       [chicoteIds]
     );
     const execucoes = await db.all(
@@ -3674,6 +3674,7 @@ app.get('/ordens-producao/monitor', async (req, res) => {
                 quemTexto: e.quemtexto,
                 colaboradores: e.colaboradores,
                 instrucoes: e.instrucoes,
+                tempoIdeal: e.tempoideal,
                 execucao: calcularExecucao(execucaoMaisRecente),
                 execucoes: execucoesEtapa,
                 concluida,
