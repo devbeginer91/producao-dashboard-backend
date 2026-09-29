@@ -285,6 +285,11 @@ const initializeDatabase = async () => {
     // uma propaga o mesmo status/tempo/quantidade pras outras do grupo.
     await db.run(`ALTER TABLE execucoes_etapa ADD COLUMN IF NOT EXISTS grupoExecucaoId INTEGER`);
 
+    // Início do trecho que a última pausa encerrou (último início/retomada). dataPausada é
+    // sobrescrita ao retomar, então sem isso não dá pra saber até onde dá pra recuar o
+    // horário de uma pausa ao corrigi-la. Pausas anteriores a essa coluna ficam NULL.
+    await db.run(`ALTER TABLE execucoes_etapa ADD COLUMN IF NOT EXISTS inicioUltimoTrecho TEXT`);
+
     // Prioridade/ordem migrou de itens_pedidos pra pedidos (item.prioritario fica sem uso a partir daqui)
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS prioritario INTEGER DEFAULT 0`);
     await db.run(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS ordemPrioridade INTEGER`);
@@ -3162,7 +3167,7 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
     }
     const agora = formatDateToLocalISO(new Date(), 'pausar-etapa');
     const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempoSegundos(exec.datapausada || exec.inicio, agora);
-    await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, agora, id]);
+    await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2, inicioUltimoTrecho = $3 WHERE id = $4", [novoTempo, agora, exec.datapausada || exec.inicio, id]);
 
     // Etapa mesclada usa o mesmo cronômetro — pausa junto.
     if (exec.grupoexecucaoid) {
@@ -3172,7 +3177,7 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
       );
       for (const irma of irmas) {
         const tempoIrma = (Number(irma.tempoacumulado) || 0) + calcularTempoSegundos(irma.datapausada || irma.inicio, agora);
-        await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [tempoIrma, agora, irma.id]);
+        await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2, inicioUltimoTrecho = $3 WHERE id = $4", [tempoIrma, agora, irma.datapausada || irma.inicio, irma.id]);
       }
     }
 
@@ -3183,9 +3188,11 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
   }
 });
 
-// Corrige quando o colaborador esqueceu de pausar: pausa a execução como se tivesse sido
-// pausada no horário informado (fim), sem mexer no início. Só o trecho desde o último
-// início/retomada até esse horário entra no tempo acumulado.
+// Corrige o horário de pausa de uma etapa, sem mexer no início:
+// - em andamento (colaborador esqueceu de pausar): pausa como se tivesse sido pausada em "fim",
+//   somando só o trecho desde o último início/retomada até esse horário;
+// - já pausada: troca o horário da última pausa por "fim", ajustando o tempo acumulado pela
+//   diferença entre o horário novo e o antigo.
 app.put('/execucoes-etapa/:id/pausar-retroativo', async (req, res) => {
   const id = parseInt(req.params.id);
   // Aceita o valor de um <input type="datetime-local"> ("YYYY-MM-DDTHH:mm[:ss]") e grava no
@@ -3196,32 +3203,50 @@ app.put('/execucoes-etapa/:id/pausar-retroativo', async (req, res) => {
     return res.status(400).json({ message: 'Informe o horário da pausa (fim) no formato AAAA-MM-DDTHH:mm.' });
   }
   const fim = `${match[1]} ${match[2]}${match[3] || ':00'}`;
+
+  // Início do trecho que a pausa encerra e o novo tempo acumulado, pra uma execução do grupo.
+  const calcularPausa = (ex) => {
+    if (ex.status === 'em_andamento') {
+      const inicioTrecho = ex.datapausada || ex.inicio;
+      return { inicioTrecho, tempo: (Number(ex.tempoacumulado) || 0) + calcularTempoSegundos(inicioTrecho, fim) };
+    }
+    // Pausa antiga (sem inicioUltimoTrecho): o limite conhecido é o início da execução.
+    const inicioTrecho = ex.inicioultimotrecho || ex.inicio;
+    const diferenca = (new Date(fim) - new Date(ex.datapausada)) / 1000;
+    return { inicioTrecho, tempo: Math.max(0, (Number(ex.tempoacumulado) || 0) + diferenca) };
+  };
+
   try {
     const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
     if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
-    if (exec.status !== 'em_andamento') {
-      return res.status(400).json({ message: 'Essa etapa não está em andamento.' });
+    if (exec.status !== 'em_andamento' && exec.status !== 'pausado') {
+      return res.status(400).json({ message: 'Essa etapa não está em andamento nem pausada.' });
     }
-    const referencia = exec.datapausada || exec.inicio;
+    const { inicioTrecho, tempo: novoTempo } = calcularPausa(exec);
     const agora = formatDateToLocalISO(new Date(), 'pausar-retroativo');
-    if (new Date(fim) < new Date(referencia)) {
-      return res.status(400).json({ message: `O horário da pausa não pode ser antes do início/retomada (${referencia}).` });
+    if (new Date(fim) < new Date(inicioTrecho)) {
+      return res.status(400).json({ message: `O horário da pausa não pode ser antes do início/retomada (${inicioTrecho}).` });
     }
     if (new Date(fim) > new Date(agora)) {
       return res.status(400).json({ message: 'O horário da pausa não pode ser no futuro.' });
     }
-    const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempoSegundos(referencia, fim);
-    await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, fim, id]);
+    await db.run(
+      "UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2, inicioUltimoTrecho = $3 WHERE id = $4",
+      [novoTempo, fim, inicioTrecho, id]
+    );
 
-    // Etapa mesclada usa o mesmo cronômetro — pausa junto, no mesmo horário.
+    // Etapa mesclada usa o mesmo cronômetro — a pausa vale pro grupo inteiro, no mesmo horário.
     if (exec.grupoexecucaoid) {
       const irmas = await db.all(
-        "SELECT * FROM execucoes_etapa WHERE grupoExecucaoId = $1 AND id != $2 AND status = 'em_andamento'",
-        [exec.grupoexecucaoid, id]
+        'SELECT * FROM execucoes_etapa WHERE grupoExecucaoId = $1 AND id != $2 AND status = $3',
+        [exec.grupoexecucaoid, id, exec.status]
       );
       for (const irma of irmas) {
-        const tempoIrma = (Number(irma.tempoacumulado) || 0) + calcularTempoSegundos(irma.datapausada || irma.inicio, fim);
-        await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [tempoIrma, fim, irma.id]);
+        const pausaIrma = calcularPausa(irma);
+        await db.run(
+          "UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2, inicioUltimoTrecho = $3 WHERE id = $4",
+          [pausaIrma.tempo, fim, pausaIrma.inicioTrecho, irma.id]
+        );
       }
     }
 
@@ -3585,7 +3610,7 @@ app.get('/execucoes-etapa/ativas', async (req, res) => {
 app.get('/execucoes-etapa/abertas', async (req, res) => {
   try {
     const rows = await db.all(`
-      SELECT ex.id, ex.status, ex.tempoAcumulado, ex.inicio, ex.dataPausada,
+      SELECT ex.id, ex.status, ex.tempoAcumulado, ex.inicio, ex.dataPausada, ex.inicioUltimoTrecho,
              p.id AS pedidoId, p.empresa, p.numeroOS,
              ip.codigoDesenho,
              ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
@@ -3611,6 +3636,9 @@ app.get('/execucoes-etapa/abertas', async (req, res) => {
       orfao: !r.etapanome || !r.empresa,
       tempoAcumuladoBase: Math.round(Number(r.tempoacumulado) || 0),
       referenciaInicio: r.datapausada || r.inicio,
+      // Só pra pausadas: horário da pausa e início do trecho que ela encerrou (limite pra corrigir).
+      dataPausada: r.status === 'pausado' ? r.datapausada : null,
+      inicioUltimoTrecho: r.status === 'pausado' ? (r.inicioultimotrecho || r.inicio) : null,
     }));
     res.json(resultado);
   } catch (error) {
