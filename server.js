@@ -3183,6 +3183,55 @@ app.put('/execucoes-etapa/:id/pausar', async (req, res) => {
   }
 });
 
+// Corrige quando o colaborador esqueceu de pausar: pausa a execução como se tivesse sido
+// pausada no horário informado (fim), sem mexer no início. Só o trecho desde o último
+// início/retomada até esse horário entra no tempo acumulado.
+app.put('/execucoes-etapa/:id/pausar-retroativo', async (req, res) => {
+  const id = parseInt(req.params.id);
+  // Aceita o valor de um <input type="datetime-local"> ("YYYY-MM-DDTHH:mm[:ss]") e grava no
+  // mesmo formato das demais datas (horário de São Paulo, "YYYY-MM-DD HH:mm:ss"). Não passa
+  // por new Date() pra não converter o fuso do servidor.
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?$/.exec(String(req.body?.fim || ''));
+  if (!match) {
+    return res.status(400).json({ message: 'Informe o horário da pausa (fim) no formato AAAA-MM-DDTHH:mm.' });
+  }
+  const fim = `${match[1]} ${match[2]}${match[3] || ':00'}`;
+  try {
+    const exec = await db.get('SELECT * FROM execucoes_etapa WHERE id = $1', [id]);
+    if (!exec) return res.status(404).json({ message: 'Execução não encontrada.' });
+    if (exec.status !== 'em_andamento') {
+      return res.status(400).json({ message: 'Essa etapa não está em andamento.' });
+    }
+    const referencia = exec.datapausada || exec.inicio;
+    const agora = formatDateToLocalISO(new Date(), 'pausar-retroativo');
+    if (new Date(fim) < new Date(referencia)) {
+      return res.status(400).json({ message: `O horário da pausa não pode ser antes do início/retomada (${referencia}).` });
+    }
+    if (new Date(fim) > new Date(agora)) {
+      return res.status(400).json({ message: 'O horário da pausa não pode ser no futuro.' });
+    }
+    const novoTempo = (Number(exec.tempoacumulado) || 0) + calcularTempoSegundos(referencia, fim);
+    await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [novoTempo, fim, id]);
+
+    // Etapa mesclada usa o mesmo cronômetro — pausa junto, no mesmo horário.
+    if (exec.grupoexecucaoid) {
+      const irmas = await db.all(
+        "SELECT * FROM execucoes_etapa WHERE grupoExecucaoId = $1 AND id != $2 AND status = 'em_andamento'",
+        [exec.grupoexecucaoid, id]
+      );
+      for (const irma of irmas) {
+        const tempoIrma = (Number(irma.tempoacumulado) || 0) + calcularTempoSegundos(irma.datapausada || irma.inicio, fim);
+        await db.run("UPDATE execucoes_etapa SET status = 'pausado', tempoAcumulado = $1, dataPausada = $2 WHERE id = $3", [tempoIrma, fim, irma.id]);
+      }
+    }
+
+    res.json({ id, status: 'pausado', tempoAcumulado: Math.round(novoTempo), dataPausada: fim });
+  } catch (error) {
+    console.error('Erro ao ajustar pausa da etapa:', error.message);
+    res.status(500).json({ message: 'Erro ao ajustar pausa da etapa', error: error.message });
+  }
+});
+
 app.put('/execucoes-etapa/:id/retomar', async (req, res) => {
   const id = parseInt(req.params.id);
   const client = await pool.connect();
