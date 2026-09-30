@@ -770,6 +770,67 @@ app.get('/colaboradores/:id/execucoes', async (req, res) => {
   }
 });
 
+// Relatório do que o colaborador fez num período (dia, mês ou ano): todas as execuções
+// iniciadas entre "de" e "ate" (datas AAAA-MM-DD, inclusivas), com OS, item e etapa.
+// Em andamento conta o tempo até agora.
+app.get('/colaboradores/:id/execucoes-periodo', async (req, res) => {
+  const formatoData = /^\d{4}-\d{2}-\d{2}$/;
+  const { de, ate } = req.query;
+  if (!formatoData.test(de || '') || !formatoData.test(ate || '')) {
+    return res.status(400).json({ message: 'Informe o período (de e ate) no formato AAAA-MM-DD.' });
+  }
+  try {
+    const colaborador = await db.get('SELECT id, nome, matricula FROM colaboradores WHERE id = $1', [req.params.id]);
+    if (!colaborador) {
+      return res.status(404).json({ message: 'Colaborador não encontrado' });
+    }
+    const execucoes = await db.all(
+      `SELECT ex.id, ex.status, ex.inicio, ex.dataPausada, ex.dataConclusao, ex.tempoAcumulado, ex.quantidadeProduzida,
+              ec.nome AS etapaNome, ec.ordem AS etapaOrdem,
+              c.cliente, c.codigoItemCliente,
+              ip.codigoDesenho, ip.quantidadePedido,
+              p.id AS pedidoId, p.empresa, p.numeroOS
+       FROM execucoes_etapa ex
+       LEFT JOIN etapas_chicote ec ON ec.id = ex.etapa_chicote_id
+       LEFT JOIN chicotes c ON c.id = ec.chicote_id
+       LEFT JOIN itens_pedidos ip ON ip.id = ex.item_pedido_id
+       LEFT JOIN pedidos p ON p.id = ip.pedido_id
+       WHERE ex.colaborador_id = $1 AND LEFT(ex.inicio, 10) BETWEEN $2 AND $3
+       ORDER BY ex.inicio ASC`,
+      [req.params.id, de, ate]
+    );
+    const agora = formatDateToLocalISO(new Date(), 'execucoes-periodo');
+    res.json({
+      colaborador: { id: colaborador.id, nome: colaborador.nome, matricula: colaborador.matricula },
+      execucoes: execucoes.map((ex) => {
+        let tempoSegundos = Number(ex.tempoacumulado) || 0;
+        if (ex.status === 'em_andamento') tempoSegundos += calcularTempoSegundos(ex.datapausada || ex.inicio, agora);
+        return {
+          id: ex.id,
+          status: ex.status,
+          inicio: ex.inicio,
+          dataPausada: ex.status === 'pausado' ? ex.datapausada : null,
+          dataConclusao: ex.dataconclusao,
+          tempoSegundos: Math.round(tempoSegundos),
+          quantidadeProduzida: ex.quantidadeproduzida,
+          quantidadePedido: ex.quantidadepedido,
+          etapaNome: ex.etapanome,
+          etapaOrdem: ex.etapaordem,
+          cliente: ex.cliente,
+          codigoItemCliente: ex.codigoitemcliente,
+          codigoDesenho: ex.codigodesenho,
+          pedidoId: ex.pedidoid,
+          empresa: ex.empresa,
+          numeroOS: ex.numeroos,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error('Erro ao buscar execuções do colaborador no período:', error.message);
+    res.status(500).json({ message: 'Erro ao buscar execuções do colaborador no período', error: error.message });
+  }
+});
+
 app.delete('/execucoes-etapa/:id', async (req, res) => {
   try {
     const resultado = await db.run('DELETE FROM execucoes_etapa WHERE id = $1', [req.params.id]);
