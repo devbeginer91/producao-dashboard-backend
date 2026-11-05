@@ -1571,6 +1571,42 @@ app.delete('/historico-faturamentos/:id', async (req, res) => {
   }
 });
 
+// Mesma ideia do DELETE /historico-faturamentos/:id, só que pra OS inteira: apaga todos os
+// eventos de faturamento dos itens do pedido e zera o cache de faturamento dos itens.
+app.delete('/pedidos/:id/faturamentos', async (req, res) => {
+  const pedidoId = parseInt(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const itensResult = await client.query('SELECT id FROM itens_pedidos WHERE pedido_id = $1 FOR UPDATE', [pedidoId]);
+    if (itensResult.rows.length === 0) {
+      throw Object.assign(new Error('Pedido não encontrado ou sem itens'), { status: 404 });
+    }
+    const itemIds = itensResult.rows.map((i) => i.id);
+
+    const eventosResult = await client.query('DELETE FROM historico_faturamentos WHERE item_id = ANY($1::int[])', [itemIds]);
+    if (eventosResult.rowCount === 0) {
+      throw Object.assign(new Error('Essa OS não tem faturamento pra desfazer'), { status: 400 });
+    }
+    await client.query(
+      `UPDATE itens_pedidos
+       SET quantidadeFaturada = 0, valorFaturado = NULL, dataFaturamento = NULL, faturado = 0
+       WHERE pedido_id = $1`,
+      [pedidoId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ pedidoId, eventosRemovidos: eventosResult.rowCount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao desfazer faturamento da OS:', error.message);
+    res.status(error.status || 500).json({ message: error.message || 'Erro ao desfazer faturamento da OS' });
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/financeiro/relatorio', async (req, res) => {
   try {
     const { cliente, inicio, fim } = req.query;
