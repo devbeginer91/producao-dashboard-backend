@@ -1593,6 +1593,25 @@ app.get('/financeiro/relatorio', async (req, res) => {
   }
 });
 
+// Desfaz uma conclusão feita por engano: volta o pedido pra "andamento" (o único status
+// de onde dá pra concluir). Entregas e faturamento dos itens ficam como estão.
+app.put('/pedidos/:id/reabrir', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const result = await db.run(
+      "UPDATE pedidos SET status = 'andamento', dataConclusao = NULL WHERE id = $1 AND status = 'concluido'",
+      [id]
+    );
+    if (result.changes === 0) {
+      return res.status(404).json({ message: 'Pedido concluído não encontrado' });
+    }
+    res.json({ id, status: 'andamento' });
+  } catch (error) {
+    console.error('Erro ao reabrir pedido:', error.message);
+    res.status(500).json({ message: 'Erro ao reabrir pedido', error: error.message });
+  }
+});
+
 app.put('/pedidos/:id/prioridade', async (req, res) => {
   const id = parseInt(req.params.id);
   const { prioritario } = req.body;
