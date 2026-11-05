@@ -1527,6 +1527,50 @@ app.put('/pedidos/:id/faturar', async (req, res) => {
   }
 });
 
+// Desfaz um faturamento lançado por engano: apaga o evento do histórico e recalcula o
+// cache do item (quantidadeFaturada/valorFaturado/dataFaturamento/faturado) a partir dos
+// eventos que sobraram. Entregas não mudam — o saldo volta a aparecer como "a faturar".
+app.delete('/historico-faturamentos/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const eventoResult = await client.query('DELETE FROM historico_faturamentos WHERE id = $1 RETURNING item_id', [id]);
+    if (eventoResult.rows.length === 0) {
+      throw Object.assign(new Error('Faturamento não encontrado'), { status: 404 });
+    }
+    const itemId = eventoResult.rows[0].item_id;
+
+    const itemResult = await client.query('SELECT quantidadePedido FROM itens_pedidos WHERE id = $1 FOR UPDATE', [itemId]);
+    const restantes = await client.query(
+      `SELECT COALESCE(SUM(quantidadeFaturada), 0)::int AS quantidade,
+              SUM(valorFaturado) AS valor,
+              MAX(dataFaturamento) AS data
+       FROM historico_faturamentos WHERE item_id = $1`,
+      [itemId]
+    );
+    const { quantidade, valor, data } = restantes.rows[0];
+    const totalmenteFaturado = quantidade > 0 && quantidade >= Number(itemResult.rows[0].quantidadepedido);
+
+    await client.query(
+      `UPDATE itens_pedidos
+       SET quantidadeFaturada = $1, valorFaturado = $2, dataFaturamento = $3, faturado = $4
+       WHERE id = $5`,
+      [quantidade, valor, data, totalmenteFaturado ? 1 : 0, itemId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ id, itemId, quantidadeFaturada: quantidade });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao desfazer faturamento:', error.message);
+    res.status(error.status || 500).json({ message: error.message || 'Erro ao desfazer faturamento' });
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/financeiro/relatorio', async (req, res) => {
   try {
     const { cliente, inicio, fim } = req.query;
