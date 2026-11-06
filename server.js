@@ -1674,21 +1674,74 @@ app.get('/financeiro/relatorio', async (req, res) => {
 });
 
 // Desfaz uma conclusão feita por engano: volta o pedido pra "andamento" (o único status
-// de onde dá pra concluir). Entregas e faturamento dos itens ficam como estão.
+// de onde dá pra concluir). Com { desfazerEntregas: true }, também apaga as entregas que a
+// conclusão lançou (ela marca todo item como 100% entregue, num lote com a mesma dataEdicao)
+// e recalcula o entregue de cada item a partir das entregas que sobraram. Faturamento não muda.
 app.put('/pedidos/:id/reabrir', async (req, res) => {
   const id = parseInt(req.params.id);
+  const desfazerEntregas = !!req.body?.desfazerEntregas;
+  const client = await pool.connect();
   try {
-    const result = await db.run(
-      "UPDATE pedidos SET status = 'andamento', dataConclusao = NULL WHERE id = $1 AND status = 'concluido'",
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      "UPDATE pedidos SET status = 'andamento', dataConclusao = NULL WHERE id = $1 AND status = 'concluido' RETURNING id",
       [id]
     );
-    if (result.changes === 0) {
-      return res.status(404).json({ message: 'Pedido concluído não encontrado' });
+    if (result.rows.length === 0) {
+      throw Object.assign(new Error('Pedido concluído não encontrado'), { status: 404 });
     }
-    res.json({ id, status: 'andamento' });
+
+    let entregasRemovidas = 0;
+    if (desfazerEntregas) {
+      // O lote da conclusão é o mais recente do pedido; só entra a linha que é a entrega
+      // total do item (o que a conclusão grava), pra não levar junto entrega parcial manual.
+      const removidas = await client.query(
+        `DELETE FROM historico_entregas h
+         USING itens_pedidos ip
+         WHERE h.item_id = ip.id
+           AND h.pedido_id = $1
+           AND h.quantidadeEntregue = ip.quantidadePedido
+           AND h.dataEdicao = (SELECT MAX(dataEdicao) FROM historico_entregas WHERE pedido_id = $1)`,
+        [id]
+      );
+      entregasRemovidas = removidas.rowCount;
+
+      await client.query(
+        `UPDATE itens_pedidos ip
+         SET quantidadeEntregue = LEAST(ip.quantidadePedido, COALESCE(
+           (SELECT SUM(h.quantidadeEntregue) FROM historico_entregas h WHERE h.item_id = ip.id), 0))
+         WHERE ip.pedido_id = $1`,
+        [id]
+      );
+
+      const faturadoAcimaDoEntregue = await client.query(
+        'SELECT codigoDesenho FROM itens_pedidos WHERE pedido_id = $1 AND COALESCE(quantidadeFaturada, 0) > quantidadeEntregue',
+        [id]
+      );
+      if (faturadoAcimaDoEntregue.rows.length > 0) {
+        const codigos = faturadoAcimaDoEntregue.rows.map((r) => r.codigodesenho).join(', ');
+        throw Object.assign(
+          new Error(`Item(ns) ${codigos} já faturado(s). Desfaça o faturamento no Financeiro antes de desfazer as entregas.`),
+          { status: 400 }
+        );
+      }
+    }
+
+    const itens = await client.query('SELECT id, quantidadeEntregue FROM itens_pedidos WHERE pedido_id = $1', [id]);
+    await client.query('COMMIT');
+    res.json({
+      id,
+      status: 'andamento',
+      entregasRemovidas,
+      itens: itens.rows.map((i) => ({ id: i.id, quantidadeEntregue: i.quantidadeentregue })),
+    });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Erro ao reabrir pedido:', error.message);
-    res.status(500).json({ message: 'Erro ao reabrir pedido', error: error.message });
+    res.status(error.status || 500).json({ message: error.message || 'Erro ao reabrir pedido' });
+  } finally {
+    client.release();
   }
 });
 
